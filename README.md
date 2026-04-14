@@ -51,3 +51,34 @@ Blind-Assistant-AI/
 │ 
 │
 └── 📄 requirements.txt     # Danh sách thư viện cần cài đặt
+**##⚙️ Hướng Dẫn Cài Đặt**
+Yêu cầu hệ thống: Python 3.8 - 3.11, Camera (Webcam).
+
+Bước 1: Clone dự án hoặc tải mã nguồn về máy
+git clone [https://github.com/Ten-Cua-Ban/Blind-Assistant-AI.git](https://github.com/Ten-Cua-Ban/Blind-Assistant-AI.git)
+cd Blind-Assistant-AI
+Bước 2: Cài đặt thư viện
+Bạn chỉ cần chạy 1 lệnh duy nhất để cài toàn bộ thư viện:
+pip install -r requirements.txt
+⚠️ Lưu ý cho Windows: Thư viện face_recognition yêu cầu dlib. Nếu bạn gặp lỗi khi cài đặt, hãy cài đặt C++ Build Tools từ Visual Studio trước, hoặc tìm tải file dlib.whl phù hợp với phiên bản Python của bạn để cài thủ công.
+**##🚀 Cách Sử Dụng Dự Án**
+1. Dạy AI nhận diện người quen (Huấn luyện khuôn mặt)
+Trước khi chạy hệ thống, hãy đưa ảnh người quen vào thư mục dataset/Tên_Người/. Sau đó chạy lệnh sau để hệ thống trích xuất đặc trưng:
+python encode_faces.py
+2. Khởi chạy Giao diện Đồ họa (GUI - Khuyên dùng)
+Phiên bản đầy đủ tính năng nhất, dễ thao tác qua các nút bấm:
+python gui_app.py
+3. Khởi chạy Giao diện Terminal (Dành cho máy yếu)
+Nếu bạn cần tối đa hóa tốc độ khung hình (FPS) và điều khiển qua phím tắt:
+python main.py
+Bảng Phím tắt (Hotkeys) trong chế độ Terminal:
+Phím,Chức năng,Thao tác
+M,Bật / Tắt nhận diện Tiền,Tức thì
+T,Bật / Tắt phân tích Đèn giao thông,Tức thì
+O,Quét và Đọc văn bản (OCR),Tức thì
+N,Nhập điểm đến để nhận chỉ đường,Chờ nhập ở Terminal
+H,Nghe lại chỉ dẫn đường đi gần nhất,Tức thì
+F,Cập nhật lại danh sách khuôn mặt,Tức thì
+Q,Thoát chương trình,Dọn dẹp & Thoát
+**##📸 Ảnh Chụp Màn Hình (Screenshots)**
+(Gợi ý: Bạn hãy chụp 1-2 tấm ảnh lúc phần mềm đang chạy nhận diện ra đồ vật, giao diện GUI đang bật và chèn link ảnh vào đây để README thêm sinh động nhé!)
