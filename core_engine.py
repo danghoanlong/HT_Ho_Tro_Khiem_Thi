@@ -1,21 +1,58 @@
-import cv2
-import threading
-import queue
-import time
-import os
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║              BLIND ASSISTANT AI — core_engine.py                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Chứa toàn bộ logic AI, xử lý tín hiệu và tiện ích chia sẻ giữa các file. ║
+║                                                                             ║
+║  MỤC LỤC                                                                    ║
+║  ─────────────────────────────────────────────────────────────────────────  ║
+║  §1  Hằng số cấu hình      (TARGET_CLASSES, CLASS_VI, REAL_HEIGHT_M, ...)  ║
+║  §2  CalibrationManager    (học khoảng cách per-class, lưu calib.json)     ║
+║  §3  BackgroundSpeaker     (TTS tiếng Việt, gTTS + pygame, non-blocking)   ║
+║  §4  AnnouncementManager   (quản lý cooldown thông báo giọng nói)          ║
+║  §5  DistanceEstimator     (ước lượng khoảng cách thông minh)              ║
+║  §6  FaceRecognizer        (nhận diện khuôn mặt từ encodings.pickle)       ║
+║  §7  NavigationGuide       (chỉ dẫn đường đi trong nhà)                   ║
+║  §8  MoneyDetector         (nhận diện tiền VN — model custom)              ║
+║  §9  OCRReader             (đọc văn bản — EasyOCR background thread)       ║
+║  §10 TrafficLightAnalyzer  (nhận diện đèn giao thông — HSV + voting)      ║
+║  §11 TimeReader            (đọc giờ tiếng Việt qua TTS)                   ║
+║  §12 SessionLogger         (ghi lịch sử phiên — CSV + JSON)               ║
+║  §13 Hàm vẽ               (put_vi_text, draw_box_*, draw_nav_overlay)     ║
+║  §14 Hàm khởi động        (build_preload_texts)                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Cài đặt:
+    pip install ultralytics opencv-python gtts pygame Pillow easyocr
+    pip install face_recognition  (Windows: pip install cmake dlib trước)
+"""
+
+# ── Thư viện chuẩn ────────────────────────────────────────────────────────────
+import csv
 import hashlib
+import json
+import os
+import queue
 import tempfile
+import threading
+import time
+from datetime import datetime
+
+# ── Thư viện bên thứ ba ───────────────────────────────────────────────────────
+import cv2
 import numpy as np
 import pygame
 from gtts import gTTS
 from ultralytics import YOLO
 
+# ── Pillow (render chữ tiếng Việt có dấu) ────────────────────────────────────
 try:
     from PIL import Image as _PILI, ImageDraw as _PILD, ImageFont as _PILF
     _PIL_OK = True
 except ImportError:
     _PIL_OK = False
 
+# ── EasyOCR (tùy chọn) ───────────────────────────────────────────────────────
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
@@ -25,15 +62,17 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PHẦN 1: HẰNG SỐ CẤU HÌNH
+#  §1  HẰNG SỐ CẤU HÌNH
+#  Tất cả giá trị điều chỉnh hành vi hệ thống tập trung tại đây.
+#  Chỉnh sửa phần này khi muốn thay đổi ngưỡng, đường dẫn, v.v.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Nhóm class YOLO theo mức độ ưu tiên ──────────────────────────────────────
-TARGET_CLASSES_HIGH = {
+# ── 1a. Nhóm class YOLO ───────────────────────────────────────────────────────
+TARGET_CLASSES_HIGH = {          # Ưu tiên cao: phương tiện + người + đèn
     "person", "car", "motorcycle", "bicycle", "bus", "truck",
     "traffic light", "stop sign",
 }
-TARGET_CLASSES_HOME = {
+TARGET_CLASSES_HOME = {          # Đồ vật trong nhà
     "chair", "couch", "bed", "dining table", "toilet", "sink",
     "refrigerator", "microwave", "oven", "toaster", "tv",
     "laptop", "cell phone", "book", "clock", "vase",
@@ -44,164 +83,394 @@ TARGET_CLASSES_HOME = {
 }
 TARGET_CLASSES = TARGET_CLASSES_HIGH | TARGET_CLASSES_HOME
 
-# ── Tên tiếng Việt ────────────────────────────────────────────────────────────
+# ── 1b. Tên tiếng Việt ───────────────────────────────────────────────────────
 CLASS_VI = {
-    "person":        "người lạ",
-    "car":           "ô tô",
-    "motorcycle":    "xe máy",
-    "bicycle":       "xe đạp",
-    "bus":           "xe buýt",
-    "truck":         "xe tải",
-    "traffic light": "đèn giao thông",
-    "stop sign":     "biển dừng",
-    "chair":         "ghế",
-    "couch":         "ghế sofa",
-    "bed":           "giường",
-    "dining table":  "bàn ăn",
-    "toilet":        "bồn cầu",
-    "sink":          "bồn rửa tay",
-    "door":          "cửa ra vào",
-    "stairs":        "cầu thang",
-    "bench":         "ghế dài",
-    "refrigerator":  "tủ lạnh",
-    "microwave":     "lò vi sóng",
-    "oven":          "lò nướng",
-    "toaster":       "máy nướng bánh",
-    "tv":            "ti vi",
-    "laptop":        "máy tính xách tay",
-    "cell phone":    "điện thoại",
-    "keyboard":      "bàn phím",
-    "mouse":         "chuột máy tính",
-    "remote":        "điều khiển từ xa",
-    "bottle":        "chai",
-    "cup":           "cốc",
-    "bowl":          "bát",
-    "knife":         "dao",
-    "fork":          "nĩa",
-    "spoon":         "muỗng",
-    "book":          "quyển sách",
-    "clock":         "đồng hồ",
-    "vase":          "lọ hoa",
-    "potted plant":  "chậu cây",
-    "backpack":      "ba lô",
-    "handbag":       "túi xách",
-    "suitcase":      "vali",
+    "person":        "người lạ",     "car":           "ô tô",
+    "motorcycle":    "xe máy",       "bicycle":       "xe đạp",
+    "bus":           "xe buýt",      "truck":         "xe tải",
+    "traffic light": "đèn giao thông","stop sign":    "biển dừng",
+    "chair":         "ghế",          "couch":         "ghế sofa",
+    "bed":           "giường",       "dining table":  "bàn ăn",
+    "toilet":        "bồn cầu",      "sink":          "bồn rửa tay",
+    "door":          "cửa ra vào",   "stairs":        "cầu thang",
+    "bench":         "ghế dài",      "refrigerator":  "tủ lạnh",
+    "microwave":     "lò vi sóng",   "oven":          "lò nướng",
+    "toaster":       "máy nướng bánh","tv":           "ti vi",
+    "laptop":        "máy tính xách tay","cell phone":"điện thoại",
+    "keyboard":      "bàn phím",     "mouse":         "chuột máy tính",
+    "remote":        "điều khiển từ xa","bottle":     "chai",
+    "cup":           "cốc",          "bowl":          "bát",
+    "knife":         "dao",          "fork":          "nĩa",
+    "spoon":         "muỗng",        "book":          "quyển sách",
+    "clock":         "đồng hồ",      "vase":          "lọ hoa",
+    "potted plant":  "chậu cây",     "backpack":      "ba lô",
+    "handbag":       "túi xách",     "suitcase":      "vali",
     "umbrella":      "ô dù",
 }
 
-# ── Màu bounding box theo BGR ─────────────────────────────────────────────────
+# ── 1c. Màu bounding box (BGR) ───────────────────────────────────────────────
 CLASS_COLORS = {
-    "person":        (0,   220,   0),
-    "car":           (0,     0, 220),
-    "motorcycle":    (220,   0, 220),
-    "bicycle":       (255, 140,   0),
-    "bus":           (0,     0, 180),
-    "truck":         (0,    30, 200),
-    "stairs":        (0,     0, 255),
-    "chair":         (0,   165, 255),
-    "couch":         (0,   200, 255),
-    "bed":           (0,   255, 200),
-    "dining table":  (50,  200, 200),
-    "door":          (200, 100,   0),
-    "refrigerator":  (180, 180,   0),
+    "person":        (0,   220,   0),   "car":           (0,     0, 220),
+    "motorcycle":    (220,   0, 220),   "bicycle":       (255, 140,   0),
+    "bus":           (0,     0, 180),   "truck":         (0,    30, 200),
+    "stairs":        (0,     0, 255),   "chair":         (0,   165, 255),
+    "couch":         (0,   200, 255),   "bed":           (0,   255, 200),
+    "dining table":  (50,  200, 200),   "door":          (200, 100,   0),
+    "refrigerator":  (180, 180,   0),   "traffic light": (255, 255,   0),
     "default":       (120, 120, 120),
-    "traffic light": (255, 255,   0),
 }
 
-# ── Chiều cao thực tế (mét) — dùng tính khoảng cách ─────────────────────────
+# ── 1d. Khoảng cách — chiều cao & chiều rộng thực tế (mét) ──────────────────
 REAL_HEIGHT_M = {
-    "person":        1.70,
-    "car":           1.50,
-    "motorcycle":    1.10,
-    "bicycle":       1.00,
-    "bus":           3.00,
-    "truck":         2.50,
-    "chair":         0.90,
-    "couch":         0.85,
-    "bed":           0.55,
-    "dining table":  0.75,
-    "toilet":        0.70,
-    "sink":          0.50,
-    "refrigerator":  1.70,
-    "tv":            0.60,
-    "laptop":        0.25,
-    "door":          2.00,
-    "stairs":        0.20,
-    "bottle":        0.25,
-    "cup":           0.10,
-    "backpack":      0.45,
-    "suitcase":      0.60,
-    "default":       0.80,
+    "person": 1.70, "car": 1.50, "motorcycle": 1.10, "bicycle": 1.00,
+    "bus": 3.00, "truck": 2.50, "chair": 0.90, "couch": 0.85,
+    "bed": 0.55, "dining table": 0.75, "toilet": 0.70, "sink": 0.50,
+    "refrigerator": 1.70, "tv": 0.60, "laptop": 0.25, "door": 2.00,
+    "stairs": 0.20, "bottle": 0.25, "cup": 0.10, "backpack": 0.45,
+    "suitcase": 0.60, "default": 0.80,
+}
+REAL_WIDTH_M = {
+    "car": 1.80, "bus": 2.50, "truck": 2.40, "motorcycle": 0.70,
+    "bicycle": 0.55, "person": 0.50, "dining table": 1.20,
+    "couch": 1.80, "bed": 1.40, "refrigerator": 0.70, "tv": 1.00,
+    "default": 0.60,
 }
 
-# ── Module khoảng cách ────────────────────────────────────────────────────────
-FOCAL_LENGTH    = 615.0   # px — webcam 640×480 thông thường
-WARN_DIST_M     = 1.5     # mét — ngưỡng cảnh báo GẦN
-CRITICAL_DIST_M = 0.8     # mét — ngưỡng nguy hiểm khẩn
+# Hệ số bù YOLO underdetect: bbox YOLO thường nhỏ hơn vật thực
+# (vd: person 0.78 → YOLO detect ~78% chiều cao thực)
+BBOX_COVERAGE = {
+    "person": 0.78, "cell phone": 0.65, "laptop": 0.72,
+    "car": 0.88, "motorcycle": 0.85, "bicycle": 0.82,
+    "bus": 0.90, "truck": 0.88, "chair": 0.80, "couch": 0.82,
+    "bed": 0.75, "dining table": 0.80, "refrigerator": 0.85,
+    "tv": 0.85, "door": 0.88, "bottle": 0.80, "cup": 0.78,
+    "backpack": 0.80, "suitcase": 0.82, "default": 0.80,
+}
 
-# ── Frame skipping ────────────────────────────────────────────────────────────
-YOLO_SKIP        = 3
-MONEY_SKIP       = 5
-TRAFFIC_SKIP     = 2
-FACE_SKIP        = 6      # Chạy face recognition mỗi N frame
-FACE_ANNOUNCE_CD = 8.0    # Giây cooldown giữa 2 lần thông báo cùng 1 người
+# ── 1e. Khoảng cách — ngưỡng cảnh báo ───────────────────────────────────────
+#   FOCAL_LENGTH: tiêu cự webcam (px). Tự động được cập nhật khi calibrate.
+#   Nhấn C (terminal) hoặc nút Calibrate (GUI) để hiệu chỉnh.
+FOCAL_LENGTH    = 615.0   # px — giá trị mặc định cho webcam 640×480
+WARN_DIST_M     = 1.5     # mét → trạng thái "near" (cảnh báo)
+CRITICAL_DIST_M = 0.80    # mét → trạng thái "critical" (nguy hiểm)
+CALIB_FILE      = "calib.json"
 
-# ── Paths & model files ───────────────────────────────────────────────────────
-FACE_ENCODINGS   = "Model/encodings.pickle"
-MONEY_MODEL_PATH = "Model/money_v8n.pt"
+# ── 1f. Frame skipping ───────────────────────────────────────────────────────
+YOLO_SKIP  = 3   # Chạy YOLO mỗi N frame
+MONEY_SKIP = 5   # Chạy model tiền mỗi N frame
+FACE_SKIP  = 6   # Chạy nhận diện khuôn mặt mỗi N frame
 
-# ── YOLO inference ────────────────────────────────────────────────────────────
+# ── 1g. YOLO inference ───────────────────────────────────────────────────────
 YOLO_CONF  = 0.40
 YOLO_IOU   = 0.50
 MONEY_CONF = 0.55
 
-# ── TTS cooldown (giây) ───────────────────────────────────────────────────────
-ANNOUNCE_COOLDOWN = 4.0
-MONEY_COOLDOWN    = 3.0
-TRAFFIC_COOLDOWN  = 2.5
-NAV_COOLDOWN      = 3.0
-TTS_CACHE_DIR     = os.path.join(tempfile.gettempdir(), "blind_tts_cache")
+# ── 1h. Đường dẫn file ───────────────────────────────────────────────────────
+FACE_ENCODINGS   = "Model/encodings.pickle"
+MONEY_MODEL_PATH = "Model/money_v8n.pt"
 
-# ── Tiền Việt Nam ─────────────────────────────────────────────────────────────
+# ── 1i. Cooldown TTS (giây) — khoảng cách tối thiểu giữa 2 lần thông báo ────
+ANNOUNCE_COOLDOWN        = 5.0    # vật cản near
+CRIT_COOLDOWN            = 5.0    # vật cản critical
+FACE_ANNOUNCE_CD         = 10.0   # nhận ra người quen (lần đầu)
+KNOWN_PERSON_ANNOUNCE_CD = 15.0   # người quen đang ở gần
+MONEY_COOLDOWN           = 3.0    # tiền
+TRAFFIC_COOLDOWN         = 2.5    # đèn giao thông
+NAV_COOLDOWN             = 3.0    # điều hướng
+TTS_CACHE_DIR            = os.path.join(tempfile.gettempdir(), "blind_tts_cache")
+
+# ── 1j. Tiền Việt Nam — ánh xạ label model → tên đọc tiếng Việt ─────────────
+# Hỗ trợ 3 định dạng label model hay trả về: số nguyên, "k", dấu chấm
 MONEY_VI = {
-    "500":    "năm trăm đồng",
-    "1000":   "một nghìn đồng",
-    "2000":   "hai nghìn đồng",
-    "5000":   "năm nghìn đồng",
-    "10000":  "mười nghìn đồng",
-    "20000":  "hai mươi nghìn đồng",
-    "50000":  "năm mươi nghìn đồng",
-    "100000": "một trăm nghìn đồng",
-    "200000": "hai trăm nghìn đồng",
+    # Số nguyên
+    "200": "hai trăm đồng",        "500": "năm trăm đồng",
+    "1000": "một nghìn đồng",      "2000": "hai nghìn đồng",
+    "5000": "năm nghìn đồng",      "10000": "mười nghìn đồng",
+    "20000": "hai mươi nghìn đồng","50000": "năm mươi nghìn đồng",
+    "100000": "một trăm nghìn đồng","200000": "hai trăm nghìn đồng",
     "500000": "năm trăm nghìn đồng",
+    # Dạng "k"
+    "0.2k": "hai trăm đồng",       "0.5k": "năm trăm đồng",
+    "1k": "một nghìn đồng",        "2k": "hai nghìn đồng",
+    "5k": "năm nghìn đồng",        "10k": "mười nghìn đồng",
+    "20k": "hai mươi nghìn đồng",  "50k": "năm mươi nghìn đồng",
+    "100k": "một trăm nghìn đồng", "200k": "hai trăm nghìn đồng",
+    "500k": "năm trăm nghìn đồng",
+    # Dạng dấu chấm
+    "1.000": "một nghìn đồng",     "2.000": "hai nghìn đồng",
+    "5.000": "năm nghìn đồng",     "10.000": "mười nghìn đồng",
+    "20.000": "hai mươi nghìn đồng","50.000": "năm mươi nghìn đồng",
+    "100.000": "một trăm nghìn đồng","200.000": "hai trăm nghìn đồng",
+    "500.000": "năm trăm nghìn đồng",
 }
 
-# ── Đèn giao thông ────────────────────────────────────────────────────────────
+# ── 1k. Đèn giao thông ───────────────────────────────────────────────────────
+# HSV: H 0-179 · S 0-255 · V 0-255
 TRAFFIC_HSV = {
-    "red":    [(  0,  80, 80, 10, 255, 255),
-               (160,  80, 80, 180, 255, 255)],
-    "green":  [(40,   60, 60,  85, 255, 255)],
-    "yellow": [(20,   80, 80,  35, 255, 255)],
+    "red":    [(0, 120, 80, 10, 255, 255), (165, 120, 80, 179, 255, 255)],
+    "green":  [(50, 80, 70, 95, 255, 255)],
+    "yellow": [(18, 100, 80, 42, 255, 255)],
 }
 TRAFFIC_COLORS_BGR = {
-    "red":    (0,   0,  220),
-    "green":  (0, 200,    0),
-    "yellow": (0, 200,  220),
-    "unknown":(80,  80,  80),
+    "red":    (0,   0, 220), "green":   (0, 200,   0),
+    "yellow": (0, 200, 220), "unknown": (80,  80,  80),
 }
 TRAFFIC_VI = {
-    "red":    "Đèn đỏ, dừng lại",
-    "green":  "Đèn xanh, được đi",
-    "yellow": "Đèn vàng, chú ý",
-    "unknown":"Phía trước có đèn giao thông",
+    "red":    "Đèn đỏ, dừng lại",  "green":   "Đèn xanh, được đi",
+    "yellow": "Đèn vàng, chú ý",   "unknown": "Phía trước có đèn giao thông",
 }
 
-# ── OCR ───────────────────────────────────────────────────────────────────────
+# ── 1l. Điều hướng trong nhà ─────────────────────────────────────────────────
+ROOM_MAP: dict[str, dict] = {
+    "phòng bếp":   {"direction_hint": "Đi thẳng rồi rẽ phải"},
+    "nhà vệ sinh": {"direction_hint": "Đi thẳng rồi rẽ trái"},
+    "phòng ngủ":   {"direction_hint": "Rẽ phải, đi thẳng"},
+    "phòng khách": {"direction_hint": "Đi thẳng"},
+    "cửa ra":      {"direction_hint": "Quay lại, đi thẳng"},
+    "tivi":        {"direction_hint": "Rẽ trái, đi thẳng"},
+}
+ROOM_ALIASES: dict[str, str] = {
+    "bếp": "phòng bếp", "toilet": "nhà vệ sinh", "wc": "nhà vệ sinh",
+    "ngủ": "phòng ngủ", "khách": "phòng khách", "cửa": "cửa ra",
+    "tv": "tivi",
+}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §2  CALIBRATION MANAGER
+#  Lưu/load tiêu cự focal và correction scale per-class vào calib.json.
+#  Học từ nhiều điểm đo (multi-point averaging) để ngày càng chính xác.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CalibrationManager:
+    """
+    Quản lý calibration FOCAL_LENGTH để khoảng cách chính xác theo camera thực.
+
+    Vì sao cần calibrate:
+    ─────────────────────────────────────────────────────────────────────────
+    FOCAL_LENGTH = 615px là ước lượng lý thuyết cho webcam 640×480 FOV 60°.
+    Camera thực tế có thể lệch 20-50% tuỳ loại:
+      - Webcam USB thường: 500-700px
+      - Laptop built-in: 550-650px
+      - Điện thoại: 700-900px (góc rộng hơn)
+
+    Khi FOCAL sai 3x → khoảng cách sai 3x:
+      - Bạn 50cm → báo 150cm: FOCAL cần giảm xuống còn 1/3
+
+    Cách calibrate:
+    ─────────────────────────────────────────────────────────────────────────
+    1. Đứng trước camera, giữ vật tham chiếu (mặc định: 'person' = bản thân)
+    2. Nhấn C (Terminal) hoặc nút Calibrate (GUI)
+    3. Nhập khoảng cách thực (cm) và class đang dùng
+    4. Hệ thống tính FOCAL mới và lưu vào calib.json
+    5. Lần sau khởi động tự load — không cần calibrate lại
+    ─────────────────────────────────────────────────────────────────────────
+    """
+
+    def __init__(self, calib_file: str = CALIB_FILE):
+        self._file   = calib_file
+        self.focal   = FOCAL_LENGTH          # Sẽ được override khi load
+        self.scales: dict[str, float] = {}   # Per-class extra correction
+        self._load()
+
+    def _load(self):
+        """Load focal length và scales đã calibrate từ file."""
+        import json
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.focal  = float(data.get("focal_length", FOCAL_LENGTH))
+            self.scales = data.get("class_scales", {})
+            print(f"[Calib] ✓ Loaded focal={self.focal:.1f}px "
+                  f"từ {self._file}")
+            if self.scales:
+                print(f"[Calib]   Per-class: {self.scales}")
+        except FileNotFoundError:
+            print(f"[Calib] Chưa có {self._file} — dùng focal mặc định "
+                  f"{FOCAL_LENGTH}px")
+            print(f"[Calib] → Nhấn C để calibrate cho camera của bạn")
+        except Exception as e:
+            print(f"[Calib] Lỗi load: {e} — dùng focal mặc định")
+
+    def save(self):
+        """Lưu calibration ra file JSON."""
+        import json
+        data = {
+            "focal_length":  round(self.focal, 2),
+            "class_scales":  {k: round(v, 4) for k, v in self.scales.items()},
+        }
+        try:
+            with open(self._file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"[Calib] ✓ Đã lưu focal={self.focal:.1f}px → {self._file}")
+        except Exception as e:
+            print(f"[Calib] Lỗi lưu: {e}")
+
+    def calibrate_from_bbox(self, cls_name: str,
+                            x1: int, y1: int, x2: int, y2: int,
+                            true_dist_m: float,
+                            frame_w: int = 640, frame_h: int = 480) -> float:
+        """
+        Calibrate per-class scale sao cho estimate() trả về đúng true_dist_m.
+
+        Fix bug quan trọng:
+        ─────────────────────────────────────────────────────────────────
+        Trước đây tính est bằng công thức nội bộ ≠ công thức của estimate().
+        → Scale sai cơ sở → sau calibrate vẫn bị lệch.
+
+        Giờ dùng estimate() VỚI scale=1.0 làm cơ sở tính scale.
+        Đảm bảo: estimate() * scale = true_dist_m (chính xác).
+        ─────────────────────────────────────────────────────────────────
+        """
+        # Bước 1: Tạm thời đặt scale = 1.0 để lấy estimate thuần
+        old_scale = self.scales.get(cls_name, 1.0)
+        self.scales[cls_name] = 1.0
+
+        # Bước 2: Gọi estimate() với scale=1.0 — đây là baseline thực sự
+        # Không truyền track_key để tránh EMA làm sai
+        est_no_scale = DistanceEstimator.estimate(
+            cls_name, x1, y1, x2, y2,
+            frame_w=frame_w, frame_h=frame_h,
+            track_key=None,
+        )
+
+        # Bước 3: Tính scale để estimate() * scale = true_dist_m
+        if est_no_scale <= 0:
+            print(f"[Calib] ✗ estimate() trả về 0 — hủy calibration")
+            self.scales[cls_name] = old_scale
+            return old_scale
+
+        new_scale = true_dist_m / est_no_scale
+
+        # Bước 4: Lưu scale mới
+        self.scales[cls_name] = round(new_scale, 4)
+
+        # Bước 5: Xóa EMA cache cho class này — tránh buffer cũ kéo sai
+        DistanceEstimator.clear_ema_for_class(cls_name)
+
+        print(f"[Calib] ─────────────────────────────────────────────")
+        print(f"[Calib] Class  : {cls_name}")
+        print(f"[Calib] bbox   : ({x1},{y1}) → ({x2},{y2})")
+        print(f"[Calib] est_raw: {est_no_scale*100:.0f} cm  (scale=1.0)")
+        print(f"[Calib] thực tế: {true_dist_m*100:.0f} cm")
+        print(f"[Calib] scale  : {old_scale:.4f} → {new_scale:.4f}  "
+              f"({'giảm' if new_scale < 1 else 'tăng'} {abs(1-new_scale)*100:.0f}%)")
+        print(f"[Calib] kiểm tra: {est_no_scale*new_scale*100:.0f} cm "
+              f"(phải = {true_dist_m*100:.0f} cm)")
+        print(f"[Calib] ─────────────────────────────────────────────")
+
+        self.save()
+        return new_scale
+
+    def add_class_measurement(self, cls_name: str,
+                              x1: int, y1: int, x2: int, y2: int,
+                              true_dist_m: float,
+                              frame_w: int = 640, frame_h: int = 480) -> float:
+        """
+        Thêm 1 điểm đo, tính scale trung bình (multi-point averaging).
+
+        Fix bug: dùng estimate() với scale=1.0 làm baseline,
+        đảm bảo scale mới áp vào estimate() cho kết quả đúng true_dist_m.
+        """
+        import json
+
+        # Baseline thực sự = estimate() không có scale
+        old_scale = self.scales.get(cls_name, 1.0)
+        self.scales[cls_name] = 1.0
+        est_no_scale = DistanceEstimator.estimate(
+            cls_name, x1, y1, x2, y2,
+            frame_w=frame_w, frame_h=frame_h,
+            track_key=None,
+        )
+        self.scales[cls_name] = old_scale   # Khôi phục để tính history
+
+        if est_no_scale <= 0:
+            return old_scale
+
+        new_scale = true_dist_m / est_no_scale
+
+        # Đọc lịch sử
+        history: list[float] = []
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            history = data.get("measurement_history", {}).get(cls_name, [])
+        except Exception:
+            data = {}
+
+        history.append(round(new_scale, 4))
+        history = history[-10:]   # giữ 10 điểm gần nhất
+
+        # Tính trung bình, lọc outlier ±30%
+        if len(history) >= 3:
+            med      = sorted(history)[len(history) // 2]
+            filtered = [s for s in history if abs(s - med) / max(med, 0.001) <= 0.30]
+            final    = sum(filtered) / max(len(filtered), 1)
+        else:
+            final = sum(history) / len(history)
+
+        final = round(final, 4)
+        self.scales[cls_name] = final
+
+        # Xóa EMA để kết quả mới được phản ánh ngay
+        DistanceEstimator.clear_ema_for_class(cls_name)
+
+        print(f"[Calib] '{cls_name}': "
+              f"est_raw={est_no_scale*100:.0f}cm → nhập={true_dist_m*100:.0f}cm  "
+              f"scale_mới={new_scale:.4f}  avg({len(history)} điểm)={final:.4f}")
+
+        # Lưu vào file
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if "measurement_history" not in data:
+            data["measurement_history"] = {}
+        data["measurement_history"][cls_name] = history
+        data["focal_length"]  = round(self.focal, 2)
+        data["class_scales"]  = {k: round(v, 4) for k, v in self.scales.items()}
+        try:
+            with open(self._file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Calib] Lỗi lưu: {e}")
+
+        return final
+
+    def get_measurement_count(self, cls_name: str) -> int:
+        import json
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                return len(json.load(f).get("measurement_history", {}).get(cls_name, []))
+        except Exception:
+            return 0
+
+    def get_all_history(self) -> dict[str, list[float]]:
+        import json
+        try:
+            with open(self._file, "r", encoding="utf-8") as f:
+                return json.load(f).get("measurement_history", {})
+        except Exception:
+            return {}
+
+    def get_scale(self, cls_name: str) -> float:
+        """Trả về correction scale cho class (mặc định 1.0)."""
+        return self.scales.get(cls_name, 1.0)
+
+
+# Singleton instance dùng toàn hệ thống
+_calibration = CalibrationManager()
+
+# Alias để tương thích với gui_app.py và main.py
+DistanceCalibrator = CalibrationManager
+
+# Bổ sung constants OCR và ROOM_MAP (chưa có trong §1)
 OCR_LANGUAGES = ["vi", "en"]
 OCR_MIN_CONF  = 0.50
 OCR_MAX_CHARS = 120
 
-# ── Bản đồ phòng (Navigation) ─────────────────────────────────────────────────
 ROOM_MAP = {
     "phòng bếp":   {"landmark": "refrigerator", "direction_hint": "Hãy đi về phía tủ lạnh",    "arrived_when": 1.2},
     "nhà vệ sinh": {"landmark": "toilet",        "direction_hint": "Hãy đi về phía bồn cầu",     "arrived_when": 1.0},
@@ -213,19 +482,32 @@ ROOM_MAP = {
     "bồn rửa tay": {"landmark": "sink",          "direction_hint": "Hãy đi về phía bồn rửa tay", "arrived_when": 0.8},
 }
 ROOM_ALIASES = {
-    "bếp":    "phòng bếp",
-    "wc":     "nhà vệ sinh",
-    "toilet": "nhà vệ sinh",
-    "ngủ":    "phòng ngủ",
-    "khách":  "phòng khách",
+    "bếp": "phòng bếp", "wc": "nhà vệ sinh", "toilet": "nhà vệ sinh",
+    "ngủ": "phòng ngủ", "khách": "phòng khách",
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  PHẦN 2: CORE CLASSES
-# ══════════════════════════════════════════════════════════════════════════════
+def normalize_money_label(raw_label: str) -> str:
+    """Chuẩn hóa label tiền từ model về key trong MONEY_VI.
+    Hỗ trợ: '10k', '10K', '10.000', '10000', 'VND10000', v.v."""
+    import re
+    s = raw_label.strip().lower().replace(" ", "")
+    s = re.sub(r'^[a-z]+(?=[\d])', '', s)
+    if s in MONEY_VI: return s
+    s2 = re.sub(r'[a-zđ]+$', '', s)
+    if s2 in MONEY_VI: return s2
+    s3 = s2.replace(".", "").replace(",", "")
+    if s3 in MONEY_VI: return s3
+    m = re.match(r'^(\d+(?:\.\d+)?)k$', s)
+    if m:
+        key = str(int(float(m.group(1)) * 1000))
+        if key in MONEY_VI: return key
+    return raw_label
 
-# ── MODULE 2: BackgroundSpeaker ───────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §3  BACKGROUND SPEAKER  —  TTS tiếng Việt, non-blocking
+# ══════════════════════════════════════════════════════════════════════════════
 
 class BackgroundSpeaker:
     """
@@ -305,7 +587,9 @@ class BackgroundSpeaker:
         self._thread.join(timeout=2)
 
 
-# ── MODULE 2b: AnnouncementManager ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  §4  ANNOUNCEMENT MANAGER  —  Quản lý cooldown thông báo giọng nói
+# ══════════════════════════════════════════════════════════════════════════════
 
 class AnnouncementManager:
     """
@@ -326,28 +610,45 @@ class AnnouncementManager:
         return False
 
     def process_obstacles(self, detections: list[dict]):
-        """Thông báo vật cản theo mức độ ưu tiên critical > near."""
+        """
+        Thông báo vật cản theo mức độ ưu tiên critical > near.
+
+        Quy tắc:
+        - Người quen (is_known=True) bị bỏ qua hoàn toàn ở đây.
+          Họ được xử lý bởi process_face_nearby() với cooldown dài hơn.
+        - Chỉ đọc 1 cảnh báo critical mỗi cycle (vật gần nhất).
+        - Cooldown per-label tránh lặp cùng 1 vật liên tục.
+        """
         critical_items = []
         near_items     = []
+
         for det in detections:
-            state   = det.get("state", "far")
-            lbl     = det["label"]
-            dist    = det.get("dist_m", 99)
+            state    = det.get("state", "far")
+            lbl      = det["label"]
+            is_known = det.get("is_known", False)
+            dist     = det.get("dist_m", 99)
+
+            # Người quen KHÔNG được thông báo là "người lạ"
+            if is_known:
+                continue
+
             vi      = CLASS_VI.get(lbl, lbl)
             dist_vi = DistanceEstimator.dist_text_vi(dist)
+
             if state == "critical":
                 critical_items.append((vi, dist_vi, lbl))
             elif state == "near":
                 near_items.append((vi, dist_vi, lbl))
 
-        # Chỉ đọc 1 vật nguy hiểm nhất mỗi lần
+        # Chỉ đọc 1 cảnh báo critical mỗi cycle
         for vi, dist_vi, lbl in critical_items:
-            if self._can_announce(f"crit_{lbl}", 3.0):
+            if self._can_announce(f"crit_{lbl}", CRIT_COOLDOWN):
                 msg = f"Nguy hiểm! Phía trước có {vi} cách {dist_vi}!"
                 self._speaker.say(msg, priority=True)
                 print(f"[Warn‼] {msg}")
-                return
+                return   # Không đọc thêm near nếu đã có critical
 
+        # Near: gộp câu, cooldown per-label
         to_say = []
         for vi, dist_vi, lbl in near_items:
             if self._can_announce(lbl, ANNOUNCE_COOLDOWN):
@@ -357,11 +658,32 @@ class AnnouncementManager:
             self._speaker.say(msg)
             print(f"[Warn] {msg}")
 
+    def process_face_nearby(self, name: str, state: str, dist_m: float):
+        """
+        Thông báo riêng khi người quen ở gần hoặc rất gần.
+        Cooldown dài (KNOWN_PERSON_ANNOUNCE_CD=15s) để không lặp.
+        Chỉ thông báo khi near/critical — xa thì im.
+        """
+        if state == "far":
+            return
+        key = f"known_near_{name}"
+        if not self._can_announce(key, KNOWN_PERSON_ANNOUNCE_CD):
+            return
+        dist_vi = DistanceEstimator.dist_text_vi(dist_m)
+        if state == "critical":
+            msg = f"{name} đang rất gần, cách {dist_vi}"
+        else:
+            msg = f"Phía trước có {name}, cách {dist_vi}"
+        self._speaker.say(msg, priority=(state == "critical"))
+        print(f"[Face‑Near] → {msg}")
+
     def process_money(self, money_label: str):
-        if self._can_announce(f"money_{money_label}", MONEY_COOLDOWN):
-            vi_name = MONEY_VI.get(money_label, f"tờ {money_label}")
+        norm    = normalize_money_label(money_label)
+        vi_name = MONEY_VI.get(norm, f"tờ {money_label}")
+        key     = f"money_{norm}"
+        if self._can_announce(key, MONEY_COOLDOWN):
             msg = f"Đây là tờ {vi_name}"
-            print(f"[Money] → {msg}")
+            print(f"[Money] → {msg}  (label gốc: '{money_label}' → chuẩn hóa: '{norm}')")
             self._speaker.say(msg, priority=True)
 
     def process_traffic(self, color: str):
@@ -398,60 +720,234 @@ class AnnouncementManager:
             self._speaker.say(msg, priority=True)
 
 
-# ── MODULE 3: DistanceEstimator ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  §5  DISTANCE ESTIMATOR  —  Ước lượng khoảng cách (calibration-aware)
+# ══════════════════════════════════════════════════════════════════════════════
 
 class DistanceEstimator:
     """
-    Ước lượng khoảng cách thực tế bằng công thức quang học:
-        D = (H_real * focal_length) / h_bbox
-    H_real: chiều cao thực tế vật (mét), focal_length: tiêu cự camera (px).
+    Ước lượng khoảng cách chính xác — tích hợp CalibrationManager.
+
+    Pipeline tính khoảng cách (theo thứ tự):
+    ─────────────────────────────────────────────────────────────────
+    1. Lấy FOCAL từ CalibrationManager (đã calibrate hoặc mặc định)
+    2. Tính D_h = H_real * focal / h_px
+       Tính D_w = W_real * focal / w_px
+    3. Chia cho BBOX_COVERAGE[class]: bù trừ YOLO underdetect
+    4. Fusion D_h và D_w có trọng số theo class và aspect ratio
+    5. Nhân per-class correction scale (nếu có từ calibration)
+    6. Hiệu chỉnh perspective (vật ở rìa frame)
+    7. Hiệu chỉnh visibility (bbox chạm biên frame)
+    8. EMA smoothing qua frame (alpha=0.35, reset nếu > 2s)
+    ─────────────────────────────────────────────────────────────────
     """
 
-    @staticmethod
-    def estimate_meters(cls_name: str, y1: int, y2: int) -> float:
-        h_bbox = max(y2 - y1, 1)
-        h_real = REAL_HEIGHT_M.get(cls_name, REAL_HEIGHT_M["default"])
-        dist   = (h_real * FOCAL_LENGTH) / h_bbox
-        return round(min(max(dist, 0.1), 30.0), 1)
+    _EMA_ALPHA  = 0.35
+    # {track_key: (smoothed_dist, timestamp)}
+    _ema_cache: dict[str, tuple[float, float]] = {}
+
+    # ── Ước lượng 1 chiều ────────────────────────────────────────────────────
 
     @staticmethod
-    def classify(cls_name: str, y1: int, y2: int) -> tuple[str, float]:
-        """Trả về (state, distance_m). state: 'critical' | 'near' | 'far'."""
-        d = DistanceEstimator.estimate_meters(cls_name, y1, y2)
-        if d <= CRITICAL_DIST_M:
-            return "critical", d
-        elif d <= WARN_DIST_M:
-            return "near", d
+    def _axis_dist(real_m: float, px: int, focal: float, coverage: float) -> float:
+        """D = (real_m * focal) / (px * coverage)"""
+        return (real_m * focal) / max(px * coverage, 0.1)
+
+    # ── Hiệu chỉnh perspective ────────────────────────────────────────────────
+
+    @staticmethod
+    def _perspective(cx_norm: float) -> float:
+        """Hệ số 0.85–1.0: vật ở rìa frame cần điều chỉnh nhỏ xuống."""
+        edge = min(cx_norm, 1.0 - cx_norm) * 2   # 0=rìa → 1=giữa
+        return 0.88 + 0.12 * edge
+
+    # ── Hiệu chỉnh visibility (bbox chạm biên) ───────────────────────────────
+
+    @staticmethod
+    def _visibility(x1: int, y1: int, x2: int, y2: int,
+                    fw: int, fh: int) -> float:
+        M = 3
+        cut = 0.0
+        if x1 <= M:       cut += 0.12
+        if x2 >= fw - M:  cut += 0.12
+        if y1 <= M:        cut += 0.08
+        if y2 >= fh - M:  cut += 0.12
+        return max(1.0 - cut, 0.60)
+
+    # ── Fusion height + width ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _fuse(dh: float, dw: float, h_px: int, w_px: int,
+              cls_name: str) -> float:
+        aspect = w_px / max(h_px, 1)
+        # Mặc định: tin chiều cao hơn
+        wH = 0.65
+        WIDE = {"car","bus","truck","couch","bed","dining table","tv"}
+        if cls_name in WIDE:
+            wH = 0.38
+        # Penalty nếu aspect bất thường
+        if aspect > 3.0:
+            wH = min(wH, 0.25)
+        if aspect < 0.2:
+            wH = max(wH, 0.82)
+        wW = 1.0 - wH
+        return wH * dh + wW * dw
+
+    # ── EMA smoothing ─────────────────────────────────────────────────────────
+
+    @classmethod
+    def _smooth(cls, key: str, raw: float) -> float:
+        now = time.time()
+        if key in cls._ema_cache:
+            prev, ts = cls._ema_cache[key]
+            # Reset nếu vật biến mất lâu
+            if now - ts > 2.5:
+                smoothed = raw
+            else:
+                smoothed = cls._EMA_ALPHA * raw + (1 - cls._EMA_ALPHA) * prev
         else:
-            return "far", d
+            smoothed = raw
+        cls._ema_cache[key] = (smoothed, now)
+        return smoothed
+
+    @classmethod
+    def cleanup_stale(cls, max_age: float = 4.0):
+        now   = time.time()
+        stale = [k for k, (_, ts) in cls._ema_cache.items()
+                 if now - ts > max_age]
+        for k in stale:
+            del cls._ema_cache[k]
+
+    @classmethod
+    def clear_ema_for_class(cls, cls_name: str):
+        """Xóa EMA cache của tất cả track key thuộc class này.
+        Gọi sau khi calibrate để kết quả mới phản ánh ngay, không bị kéo bởi buffer cũ."""
+        keys = [k for k in list(cls._ema_cache.keys()) if k.startswith(cls_name)]
+        for k in keys:
+            del cls._ema_cache[k]
+        if keys:
+            print(f"[Calib] EMA cache cleared for '{cls_name}' ({len(keys)} entries)")
+
+    # ── API chính ─────────────────────────────────────────────────────────────
+
+    @classmethod
+    def estimate(cls, cls_name: str,
+                 x1: int, y1: int, x2: int, y2: int,
+                 frame_w: int = 640, frame_h: int = 480,
+                 track_key: str | None = None) -> float:
+        """
+        Ước lượng khoảng cách (mét) đã tích hợp calibration.
+
+        Returns: khoảng cách (mét), clamp [0.05, 35.0].
+        """
+        focal    = _calibration.focal
+        coverage = BBOX_COVERAGE.get(cls_name, BBOX_COVERAGE["default"])
+        h_real   = REAL_HEIGHT_M.get(cls_name, REAL_HEIGHT_M["default"])
+        w_real   = REAL_WIDTH_M.get(cls_name,  REAL_WIDTH_M["default"])
+
+        h_px = max(y2 - y1, 1)
+        w_px = max(x2 - x1, 1)
+        cx   = (x1 + x2) / 2
+
+        # Bước 1: ước lượng theo 2 trục (có coverage correction)
+        d_h = cls._axis_dist(h_real, h_px, focal, coverage)
+        d_w = cls._axis_dist(w_real, w_px, focal, coverage)
+
+        # Bước 2: fusion
+        raw = cls._fuse(d_h, d_w, h_px, w_px, cls_name)
+
+        # Bước 3: per-class scale từ calibration
+        raw *= _calibration.get_scale(cls_name)
+
+        # Bước 4: perspective
+        raw *= cls._perspective(cx / max(frame_w, 1))
+
+        # Bước 5: visibility
+        raw *= cls._visibility(x1, y1, x2, y2, frame_w, frame_h)
+
+        # Clamp
+        raw = min(max(raw, 0.05), 35.0)
+
+        # Bước 6: EMA smooth
+        if track_key:
+            raw = cls._smooth(track_key, raw)
+
+        return round(raw, 2)
+
+    @classmethod
+    def estimate_meters(cls, cls_name: str, y1: int, y2: int) -> float:
+        """Backward-compat: ước lượng chỉ từ height."""
+        return cls.estimate(cls_name, 0, y1, 0, y2)
+
+    @classmethod
+    def classify(cls, cls_name: str, y1: int, y2: int,
+                 x1: int = 0, x2: int = 0,
+                 frame_w: int = 640, frame_h: int = 480,
+                 track_key: str | None = None) -> tuple[str, float]:
+        """Trả về (state, distance_m). state: 'critical'|'near'|'far'."""
+        d = cls.estimate(cls_name, x1, y1, x2, y2, frame_w, frame_h, track_key)
+        if d <= CRITICAL_DIST_M: return "critical", d
+        if d <= WARN_DIST_M:     return "near", d
+        return "far", d
+
+    @staticmethod
+    def classify_state(dist_m: float) -> str:
+        if dist_m <= CRITICAL_DIST_M: return "critical"
+        if dist_m <= WARN_DIST_M:     return "near"
+        return "far"
 
     @staticmethod
     def box_color(state: str) -> tuple[int, int, int]:
-        if state == "critical":
-            return (0, 0, 255)
-        if state == "near":
-            return (0, 100, 255)
-        return (100, 100, 100)
+        return {"critical": (0,0,255), "near": (0,100,255)}.get(state, (100,100,100))
+
+    @staticmethod
+    def format_dist(dist_m: float) -> str:
+        """Hiển thị dạng cm."""
+        return f"{int(round(dist_m * 100))} cm"
 
     @staticmethod
     def state_label(state: str, dist_m: float) -> str:
-        if state == "critical":
-            return f"!! {dist_m:.1f}m !!"
-        elif state == "near":
-            return f"GẦN {dist_m:.1f}m"
-        else:
-            return f"{dist_m:.1f}m"
+        d = DistanceEstimator.format_dist(dist_m)
+        if state == "critical": return f"!! {d} !!"
+        if state == "near":     return f"GẦN {d}"
+        return d
 
     @staticmethod
     def dist_text_vi(dist_m: float) -> str:
-        """Chuỗi khoảng cách tự nhiên bằng tiếng Việt để đọc TTS."""
-        if dist_m < 1.0:
-            return f"{int(dist_m * 100)} xăng ti mét"
-        else:
-            return f"{dist_m:.1f} mét".replace(".", " phẩy ")
+        """
+        Chuỗi khoảng cách tiếng Việt tự nhiên cho TTS.
+        Dưới 2m dùng xăng-ti-mét; từ 2m dùng mét (tự nhiên hơn).
+        """
+        cm = int(round(dist_m * 100))
+        if cm <= 5:
+            return "chưa đầy 5 xăng ti mét"
+        if cm < 200:
+            return f"{cm} xăng ti mét"
+        # >= 2m: làm tròn 0.5m
+        m_half = round(dist_m * 2) / 2
+        if m_half == int(m_half):
+            return f"{int(m_half)} mét"
+        return f"{int(m_half)} mét rưỡi"
+
+    # ── Tiện ích chẩn đoán ────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_calib_info() -> str:
+        """Trả về chuỗi thông tin calibration hiện tại."""
+        return (f"focal={_calibration.focal:.1f}px | "
+                f"scales={_calibration.scales}")
+
+    @staticmethod
+    def get_calibration() -> "CalibrationManager":
+        """Trả về CalibrationManager singleton để GUI/main dùng."""
+        return _calibration
 
 
-# ── MODULE 8: NavigationGuide (Nâng cấp — Thông minh hơn) ───────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §7  NAVIGATION GUIDE  —  Chỉ dẫn đường đi trong nhà
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class NavigationGuide:
     # Ngưỡng giai đoạn khoảng cách (mét)
@@ -790,7 +1286,10 @@ class NavigationGuide:
         return f"{stage_prefix}{base}"
 
 
-# ── MODULE 4: MoneyDetector ───────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  §8  MONEY DETECTOR  —  Nhận diện tiền VN (model custom)
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class MoneyDetector:
     """
@@ -836,7 +1335,10 @@ class MoneyDetector:
         return detections
 
 
-# ── MODULE 5: OCRReader (Nâng cấp — Tiền xử lý ảnh + Smart TTS) ─────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  §9  OCR READER  —  Đọc văn bản (EasyOCR, background thread)
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class OCRReader:
     # Kích thước ảnh tối thiểu để OCR hiệu quả
@@ -1127,40 +1629,137 @@ class OCRReader:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
 
-# ── MODULE 6: TrafficLightAnalyzer ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  §10 TRAFFIC LIGHT  —  Nhận diện đèn giao thông (HSV + temporal voting)
+# ══════════════════════════════════════════════════════════════════════════════
+
 
 class TrafficLightAnalyzer:
     """
-    Phân tích màu đèn giao thông từ crop BGR bằng phân tích HSV.
-    Không cần train thêm — dùng YOLO để detect bbox rồi phân tích màu crop.
+    Phân tích màu đèn giao thông — 3 cải tiến chính:
+
+    1. Phân vùng dọc (Vertical Zone Analysis):
+       Đèn giao thông có 3 bóng theo chiều dọc: Đỏ (trên) → Vàng (giữa) → Xanh (dưới).
+       → Chỉ phân tích vùng có độ sáng V cao nhất thay vì toàn bbox.
+
+    2. Xác nhận chéo vị trí ↔ màu:
+       Nếu màu phát hiện mâu thuẫn với vị trí bóng sáng nhất → tin vị trí hơn.
+
+    3. Temporal Voting qua nhiều frame:
+       Giữ buffer 5 kết quả gần nhất. Màu nào đa số → output.
+       Ngăn đèn "nhấp nháy" do nhiễu ánh sáng.
     """
 
-    @staticmethod
-    def _count_color(hsv_crop: np.ndarray, ranges: list[tuple]) -> int:
-        total = 0
-        for r in ranges:
-            lo = np.array([r[0], r[1], r[2]])
-            hi = np.array([r[3], r[4], r[5]])
-            total += int(cv2.countNonZero(cv2.inRange(hsv_crop, lo, hi)))
-        return total
+    # Kích thước resize bbox trước khi phân tích (giữ tỷ lệ đứng để 3 vùng rõ)
+    _W = 32
+    _H = 96
+    # Số frame giữ trong buffer vote
+    _VOTE_N = 5
+    # Vị trí dải → màu kỳ vọng (đỏ trên, vàng giữa, xanh dưới)
+    _BAND_COLOR = {0: "red", 1: "yellow", 2: "green"}
+
+    def __init__(self):
+        # Buffer vote riêng cho mỗi đèn (key = track_key từ caller)
+        self._buffers: dict[str, list[str]] = {}
+
+    # ── Đếm pixel màu trong vùng HSV ─────────────────────────────────────────
 
     @staticmethod
-    def analyze(crop_bgr: np.ndarray) -> str:
-        """Trả về 'red' | 'green' | 'yellow' | 'unknown'."""
+    def _count(hsv: np.ndarray, ranges: list[tuple]) -> int:
+        total = 0
+        for r in ranges:
+            lo = np.array([r[0], r[1], r[2]], dtype=np.uint8)
+            hi = np.array([r[3], r[4], r[5]], dtype=np.uint8)
+            total += int(cv2.countNonZero(cv2.inRange(hsv, lo, hi)))
+        return total
+
+    # ── Tìm dải dọc sáng nhất trong 3 vùng ──────────────────────────────────
+
+    @staticmethod
+    def _brightest_band(hsv: np.ndarray) -> int:
+        """Trả về 0=trên(đỏ), 1=giữa(vàng), 2=dưới(xanh) — dải có V cao nhất."""
+        h = hsv.shape[0]
+        t = h // 3
+        means = [
+            float(np.mean(hsv[:t,    :, 2])),   # dải trên
+            float(np.mean(hsv[t:2*t, :, 2])),   # dải giữa
+            float(np.mean(hsv[2*t:,  :, 2])),   # dải dưới
+        ]
+        return int(np.argmax(means))
+
+    # ── Phân tích 1 frame (chưa qua vote) ────────────────────────────────────
+
+    def _analyze_raw(self, crop_bgr: np.ndarray) -> str:
         if crop_bgr is None or crop_bgr.size == 0:
             return "unknown"
         h, w = crop_bgr.shape[:2]
-        if h < 10 or w < 10:
+        if h < 15 or w < 8:
             return "unknown"
-        small  = cv2.resize(crop_bgr, (32, 64))
-        hsv    = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-        hsv    = cv2.GaussianBlur(hsv, (3, 3), 0)
-        counts = {c: TrafficLightAnalyzer._count_color(hsv, r)
-                  for c, r in TRAFFIC_HSV.items()}
+
+        small = cv2.resize(crop_bgr, (self._W, self._H),
+                           interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (3, 3), 0)
+        hsv   = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+
+        # Tìm dải sáng nhất và mở rộng ±4px để có đủ mẫu màu
+        band  = self._brightest_band(hsv)
+        t     = self._H // 3
+        y0    = max(0,          band * t - 4)
+        y1    = min(self._H,    band * t + t + 4)
+        region = hsv[y0:y1, :]
+
+        if region.size == 0:
+            region = hsv
+
+        # Đếm pixel mỗi màu trong vùng sáng nhất
+        counts = {c: self._count(region, r) for c, r in TRAFFIC_HSV.items()}
+        total  = region.shape[0] * region.shape[1]
         best   = max(counts, key=counts.get)
-        if sum(counts.values()) == 0 or counts[best] / (32 * 64) < 0.05:
+        ratio  = counts[best] / max(total, 1)
+
+        # Ngưỡng chấp nhận: màu chiếm >= 6% pixel vùng phân tích
+        if ratio < 0.06:
             return "unknown"
+
+        # Xác nhận chéo: nếu màu mâu thuẫn vị trí và chưa rõ ràng → tin vị trí
+        expected = self._BAND_COLOR[band]
+        if best != expected and ratio < 0.15:
+            return expected
+
         return best
+
+    # ── API công khai — có temporal voting ────────────────────────────────────
+
+    def analyze(self, crop_bgr: np.ndarray,
+                track_key: str = "default") -> str:
+        """
+        Phân tích màu đèn với temporal voting qua nhiều frame.
+        track_key: định danh đèn (vd: "tl_120_80") — tách buffer riêng mỗi đèn.
+        """
+        raw = self._analyze_raw(crop_bgr)
+
+        buf = self._buffers.setdefault(track_key, [])
+        buf.append(raw)
+        if len(buf) > self._VOTE_N:
+            buf.pop(0)
+
+        # Vote — bỏ "unknown" ra trước khi đếm
+        meaningful = [c for c in buf if c != "unknown"]
+        if not meaningful:
+            return "unknown"
+
+        from collections import Counter
+        winner, win_count = Counter(meaningful).most_common(1)[0]
+
+        # Chỉ chấp nhận khi đa số >= 40%
+        if win_count / len(meaningful) < 0.40:
+            return meaningful[-1]   # chưa ổn định → dùng kết quả mới nhất
+
+        return winner
+
+    def clear_track(self, track_key: str):
+        """Xóa buffer khi đèn biến mất khỏi frame."""
+        self._buffers.pop(track_key, None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1271,9 +1870,10 @@ def draw_box_obstacle(frame, x1, y1, x2, y2,
 
 
 def draw_box_money(frame, x1, y1, x2, y2, label, conf):
-    """Vẽ bounding box tiền với tên mệnh giá tiếng Việt."""
+    """Vẽ bounding box tiền với tên mệnh giá tiếng Việt (hỗ trợ label dạng '10k', '50.000', v.v.)."""
+    norm    = normalize_money_label(label)
+    vi_name = MONEY_VI.get(norm, label)   # fallback: hiển thị label gốc
     color   = (0, 215, 255)
-    vi_name = MONEY_VI.get(label, label)
     text    = f"{vi_name}  {conf:.0%}"
     fs      = 15
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
@@ -1326,7 +1926,344 @@ def draw_nav_overlay(frame, nav: "NavigationGuide"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PHẦN 5: HÀM TIỆN ÍCH KHỞI ĐỘNG
+#  §11 TIME READER  —  Đọc giờ hiện tại bằng tiếng Việt
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TimeReader:
+    """
+    Đọc thời gian hiện tại bằng tiếng Việt qua TTS.
+
+    Ví dụ output:
+        "Bây giờ là 9 giờ 5 phút sáng"
+        "Bây giờ là 12 giờ trưa"
+        "Bây giờ là 3 giờ 30 phút chiều"
+        "Bây giờ là 7 giờ tối"
+        "Bây giờ là 11 giờ 45 phút đêm"
+
+    Cách dùng:
+        reader = TimeReader(speaker)
+        reader.announce()     # phát TTS ngay lập tức
+        text = reader.text()  # lấy chuỗi để hiển thị
+    """
+
+    def __init__(self, speaker: "BackgroundSpeaker"):
+        self._speaker = speaker
+
+    # ── Chuyển giờ số sang tiếng Việt tự nhiên ───────────────────────────────
+
+    @staticmethod
+    def _period(hour: int) -> str:
+        """Trả về buổi trong ngày bằng tiếng Việt."""
+        if hour < 6:   return "đêm"
+        if hour < 11:  return "sáng"
+        if hour < 13:  return "trưa"
+        if hour < 18:  return "chiều"
+        return "tối"
+
+    @staticmethod
+    def _hour_12(hour: int) -> int:
+        """Chuyển giờ 24h → 12h (0 → 12, 13 → 1, v.v.)."""
+        h = hour % 12
+        return 12 if h == 0 else h
+
+    @staticmethod
+    def now_text() -> str:
+        """
+        Trả về chuỗi giờ hiện tại tự nhiên để đọc TTS.
+        Luôn dùng định dạng 12h + buổi.
+        """
+        now    = datetime.now()
+        hour   = now.hour
+        minute = now.minute
+        h12    = TimeReader._hour_12(hour)
+        period = TimeReader._period(hour)
+
+        if minute == 0:
+            return f"Bây giờ là {h12} giờ {period}"
+        elif minute < 10:
+            return f"Bây giờ là {h12} giờ 0{minute} phút {period}"
+        else:
+            return f"Bây giờ là {h12} giờ {minute} phút {period}"
+
+    @staticmethod
+    def now_display() -> str:
+        """Chuỗi ngắn để hiển thị trên màn hình: HH:MM  Thứ X  DD/MM/YYYY"""
+        now = datetime.now()
+        weekdays = ["Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm",
+                    "Thứ Sáu", "Thứ Bảy", "Chủ Nhật"]
+        wd = weekdays[now.weekday()]
+        return (f"{now.strftime('%H:%M')}  {wd}  "
+                f"{now.strftime('%d/%m/%Y')}")
+
+    def announce(self, priority: bool = True):
+        """Phát âm thanh thời gian hiện tại."""
+        text = self.now_text()
+        print(f"[Time] {text}")
+        self._speaker.say(text, priority=priority)
+        return text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHẦN 5: SESSION LOGGER — Lưu lịch sử nhận diện ra file CSV + JSON
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  §12 SESSION LOGGER  —  Ghi lịch sử phiên (CSV + JSON, 3 mức độ)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SessionLogger:
+    """
+    Ghi lịch sử nhận diện thông minh — kiểm soát cường độ ghi log.
+
+    ── 3 MỨC ĐỘ GHI (LOG_LEVEL) ────────────────────────────────────────────────
+    LOG_LEVEL = "summary"   Chỉ ghi tóm tắt cuối phiên (1 dòng/loại vật).
+                            → File nhỏ nhất, không spam.
+    LOG_LEVEL = "normal"    Ghi sự kiện quan trọng (near/critical, tiền, mặt, OCR).
+                            Có cooldown — cùng loại không ghi quá 1 lần/10s.
+                            → Cân bằng giữa chi tiết và dung lượng. (Mặc định)
+    LOG_LEVEL = "detail"    Ghi tất cả (như cũ). Dùng khi debug.
+
+    ── COOLDOWN PER-EVENT ───────────────────────────────────────────────────────
+    Cùng 1 loại vật cản không được ghi lặp trong LOG_COOLDOWN giây.
+    Ví dụ: 'person near' chỉ xuất hiện tối đa 1 lần/10s trong CSV.
+
+    ── GIỚI HẠN BỘ NHỚ ─────────────────────────────────────────────────────────
+    Chỉ giữ tối đa MAX_EVENTS sự kiện trong RAM.
+    Khi đầy → xóa 20% sự kiện cũ nhất (rolling buffer).
+    """
+
+    LOG_DIR      = "logs"
+    LOG_COOLDOWN = 10.0    # giây — cùng loại event không ghi lặp trong khoảng này
+    MAX_EVENTS   = 500     # tối đa 500 sự kiện trong RAM (≈ 150 KB)
+
+    def __init__(self, enabled: bool = True, level: str = "normal"):
+        """
+        level: "summary" | "normal" | "detail"
+        """
+        assert level in ("summary", "normal", "detail"), \
+            "level phải là 'summary', 'normal' hoặc 'detail'"
+        self.enabled     = enabled
+        self.level       = level
+        self._events:    list[dict]         = []
+        self._last_wrote: dict[str, float]  = {}   # Cooldown per event-key
+        self._counts:    dict[str, int]     = {}   # Đếm số lần mỗi loại xảy ra
+        self._start_time = datetime.now()
+        self._csv_path   = ""
+        self._json_path  = ""
+        self._csv_file   = None
+        self._writer     = None
+
+        if not enabled:
+            return
+
+        os.makedirs(self.LOG_DIR, exist_ok=True)
+        ts = self._start_time.strftime("%Y%m%d_%H%M%S")
+        self._csv_path  = os.path.join(self.LOG_DIR, f"session_{ts}.csv")
+        self._json_path = os.path.join(self.LOG_DIR, f"session_{ts}.json")
+
+        # Mở CSV (chỉ khi level != summary)
+        if level != "summary":
+            self._csv_file = open(self._csv_path, "w", newline="", encoding="utf-8-sig")
+            self._writer   = csv.DictWriter(self._csv_file, fieldnames=[
+                "timestamp", "elapsed_s", "event_type",
+                "label_vi", "state", "dist_display", "conf", "note",
+            ])
+            self._writer.writeheader()
+            self._csv_file.flush()
+
+        print(f"[Logger] Level={level} | log → {self._csv_path or '(summary only)'}")
+
+    # ── Cooldown helper ───────────────────────────────────────────────────────
+
+    def _allowed(self, key: str, cooldown: float | None = None) -> bool:
+        """Trả về True nếu event này được phép ghi (cooldown chưa hết)."""
+        cd  = cooldown if cooldown is not None else self.LOG_COOLDOWN
+        now = time.time()
+        if now - self._last_wrote.get(key, 0) >= cd:
+            self._last_wrote[key] = now
+            return True
+        return False
+
+    # ── Ghi nội bộ ───────────────────────────────────────────────────────────
+
+    def _write(self, event_type: str, label_vi: str = "", state: str = "",
+               dist_m: float | None = None, conf: float | None = None,
+               note: str = ""):
+        """Ghi 1 dòng vào CSV + thêm vào RAM buffer."""
+        if not self.enabled or self.level == "summary":
+            return
+        now     = datetime.now()
+        elapsed = (now - self._start_time).total_seconds()
+        dist_d  = DistanceEstimator.format_dist(dist_m) if dist_m is not None else ""
+        row = {
+            "timestamp":    now.strftime("%H:%M:%S"),
+            "elapsed_s":    f"{elapsed:.0f}",
+            "event_type":   event_type,
+            "label_vi":     label_vi,
+            "state":        state,
+            "dist_display": dist_d,
+            "conf":         f"{int(conf*100)}%" if conf is not None else "",
+            "note":         note,
+        }
+        # Rolling buffer: giữ tối đa MAX_EVENTS
+        self._events.append(row)
+        if len(self._events) > self.MAX_EVENTS:
+            # Xóa 20% cũ nhất
+            cut = self.MAX_EVENTS // 5
+            self._events = self._events[cut:]
+
+        if self._writer:
+            self._writer.writerow(row)
+            self._csv_file.flush()
+
+    def _count(self, key: str):
+        """Tăng bộ đếm sự kiện (dùng cho summary mode)."""
+        self._counts[key] = self._counts.get(key, 0) + 1
+
+    # ── API công khai ─────────────────────────────────────────────────────────
+
+    def log_obstacle(self, label: str, state: str, dist_m: float, conf: float):
+        """Ghi vật cản. Chỉ ghi near/critical; có cooldown 10s per-label."""
+        if state == "far":
+            return
+        vi = CLASS_VI.get(label, label)
+        self._count(f"obstacle_{label}_{state}")
+        if self.level == "detail":
+            self._write("obstacle", vi, state, dist_m, conf)
+        elif self.level == "normal":
+            key = f"obs_{label}_{state}"
+            if self._allowed(key):
+                self._write("obstacle", vi, state, dist_m, conf)
+
+    def log_face(self, name: str, dist_m: float, conf: float = 0.0):
+        """Ghi nhận ra người quen (cooldown 20s per-name)."""
+        self._count(f"face_{name}")
+        if self.level != "summary":
+            if self._allowed(f"face_{name}", 20.0):
+                self._write("face", name, "known", dist_m, conf)
+
+    def log_money(self, label_raw: str, conf: float):
+        """Ghi nhận tiền (cooldown 5s per-mệnh giá)."""
+        norm = normalize_money_label(label_raw)
+        vi   = MONEY_VI.get(norm, label_raw)
+        self._count(f"money_{norm}")
+        if self.level != "summary":
+            if self._allowed(f"money_{norm}", 5.0):
+                self._write("money", vi, conf=conf)
+
+    def log_traffic(self, color: str):
+        """Ghi đèn giao thông (cooldown 5s per-màu)."""
+        vi = TRAFFIC_VI.get(color, color)
+        self._count(f"traffic_{color}")
+        if self.level != "summary":
+            if self._allowed(f"traffic_{color}", 5.0):
+                self._write("traffic", vi)
+
+    def log_ocr(self, text: str):
+        """Ghi OCR — luôn ghi (sự kiện hiếm, quan trọng)."""
+        self._count("ocr")
+        if self.level != "summary":
+            self._write("ocr", "Văn bản", note=text[:120])
+
+    def log_nav(self, destination: str, stage: str, dist_m: float):
+        """Ghi điều hướng (cooldown 8s per-stage)."""
+        self._count(f"nav_{destination}")
+        if self.level != "summary":
+            if self._allowed(f"nav_{stage}", 8.0):
+                self._write("nav", destination, stage, dist_m)
+
+    def log_system(self, msg: str):
+        """Ghi sự kiện hệ thống — luôn ghi (không cooldown)."""
+        self._count("system")
+        if self.level != "summary":
+            self._write("system", note=msg)
+
+    # ── Tóm tắt & đóng ───────────────────────────────────────────────────────
+
+    def get_summary(self) -> dict:
+        """Trả về tóm tắt phiên hiện tại (có thể gọi bất cứ lúc nào)."""
+        elapsed = (datetime.now() - self._start_time).total_seconds()
+        # Gộp counts thành readable dict
+        obstacle_totals: dict[str, int] = {}
+        for k, v in self._counts.items():
+            if k.startswith("obstacle_"):
+                parts = k.split("_")
+                label = parts[1]
+                vi    = CLASS_VI.get(label, label)
+                obstacle_totals[vi] = obstacle_totals.get(vi, 0) + v
+
+        face_totals = {k.split("_", 1)[1]: v
+                       for k, v in self._counts.items() if k.startswith("face_")}
+        money_totals = {k.split("_", 1)[1]: v
+                        for k, v in self._counts.items() if k.startswith("money_")}
+
+        return {
+            "level":          self.level,
+            "duration_s":     round(elapsed, 0),
+            "total_detected": sum(self._counts.values()),
+            "obstacles":      dict(sorted(obstacle_totals.items(),
+                                          key=lambda x: -x[1])[:8]),
+            "faces":          face_totals,
+            "money":          money_totals,
+            "traffic":        {k.split("_",1)[1]: v
+                               for k, v in self._counts.items()
+                               if k.startswith("traffic_")},
+            "ocr_count":      self._counts.get("ocr", 0),
+            "events_in_ram":  len(self._events),
+            "csv_path":       self._csv_path,
+        }
+
+    def close(self) -> dict:
+        """Đóng logger, ghi summary JSON, trả về dict tóm tắt."""
+        if not self.enabled:
+            return {}
+
+        summary = self.get_summary()
+        summary["session_start"] = self._start_time.isoformat()
+
+        # Luôn ghi JSON summary (dù level = summary)
+        try:
+            data: dict = {"summary": summary}
+            if self.level == "detail":
+                data["events"] = self._events   # Ghi full events chỉ ở detail
+            with open(self._json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print(f"[Logger] ✓ JSON → {self._json_path}")
+        except Exception as e:
+            print(f"[Logger] Lỗi ghi JSON: {e}")
+
+        if self._csv_file:
+            self._csv_file.close()
+            print(f"[Logger] ✓ CSV  → {self._csv_path}")
+
+        print(f"[Logger] Tóm tắt phiên: "
+              f"thời gian={summary['duration_s']:.0f}s  "
+              f"phát hiện={summary['total_detected']} lần  "
+              f"level={self.level}")
+        return summary
+
+    def set_level(self, level: str):
+        """Thay đổi mức độ ghi log ngay trong khi chạy."""
+        assert level in ("summary", "normal", "detail")
+        old = self.level
+        self.level = level
+        print(f"[Logger] Level: {old} → {level}")
+        # Mở CSV nếu chuyển từ summary sang normal/detail
+        if old == "summary" and level != "summary" and not self._csv_file:
+            try:
+                self._csv_file = open(self._csv_path, "w", newline="", encoding="utf-8-sig")
+                self._writer   = csv.DictWriter(self._csv_file, fieldnames=[
+                    "timestamp", "elapsed_s", "event_type",
+                    "label_vi", "state", "dist_display", "conf", "note",
+                ])
+                self._writer.writeheader()
+            except Exception as e:
+                print(f"[Logger] Không mở được CSV: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHẦN 6: HÀM TIỆN ÍCH KHỞI ĐỘNG
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_preload_texts(extra_names: list[str] | None = None) -> list[str]:
@@ -1364,6 +2301,11 @@ def build_preload_texts(extra_names: list[str] | None = None) -> list[str]:
     for vi_name in MONEY_VI.values():
         texts.append(f"Đây là tờ {vi_name}")
     texts += list(TRAFFIC_VI.values())
+    texts += [
+        "Calibration thành công",
+        "Nhập khoảng cách thực tế bằng xăng ti mét vào terminal",
+        "Calibration hoàn tất, hệ thống đã cập nhật",
+    ]
     for room, info in ROOM_MAP.items():
         lm_vi = CLASS_VI.get(info["landmark"], info["landmark"])
         texts.append(info["direction_hint"])

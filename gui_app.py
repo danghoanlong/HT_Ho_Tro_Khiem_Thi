@@ -1,17 +1,34 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║           BLIND ASSISTANT AI — gui_app.py  (Giao diện đồ họa)             ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  Giao diện CustomTkinter — bảng điều khiển đầy đủ cho người dùng.         ║
+║  Chạy: python gui_app.py                                                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  PHÍM TẮT (khi cửa sổ GUI đang focus)                                      ║
+║  Q → Thoát     M → Tiền       O → OCR văn bản    T → Đèn giao thông       ║
+║  N → Điều hướng  F → Reload mặt  W → Đọc giờ                              ║
+║  C → Calibrate khoảng cách       R → Reset calib                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ── Thư viện chuẩn ────────────────────────────────────────────────────────────
 import cv2
-import time
 import os
 import threading
+import time
 import tkinter as tk
 import tkinter.filedialog as filedialog
-import numpy as np
+
+# ── Thư viện bên thứ ba ───────────────────────────────────────────────────────
 import customtkinter as ctk
+import numpy as np
 from PIL import Image, ImageTk
 from ultralytics import YOLO
 
-# ── Import toàn bộ logic AI từ core_engine (KHÔNG phải main.py) ──────────────
+# ── Import từ core_engine ─────────────────────────────────────────────────────
 from core_engine import (
-    # Hằng số
+    # §1 Hằng số
     TARGET_CLASSES, CLASS_VI, MONEY_VI, TRAFFIC_VI, TRAFFIC_COLORS_BGR,
     ROOM_MAP, ROOM_ALIASES,
     YOLO_CONF, YOLO_IOU, MONEY_MODEL_PATH, FACE_ENCODINGS,
@@ -19,23 +36,26 @@ from core_engine import (
     YOLO_SKIP, MONEY_SKIP, FACE_SKIP, FACE_ANNOUNCE_CD,
     ANNOUNCE_COOLDOWN, MONEY_COOLDOWN, TRAFFIC_COOLDOWN, NAV_COOLDOWN,
     OCR_MAX_CHARS,
-    # Classes AI
+    # §3–§12 Classes AI
     BackgroundSpeaker, AnnouncementManager,
     DistanceEstimator, NavigationGuide,
     MoneyDetector, OCRReader, TrafficLightAnalyzer,
-    # Hàm vẽ lên frame OpenCV (dùng trong camera loop của GUI)
+    SessionLogger, TimeReader,
+    # §13 Hàm vẽ
     draw_box_obstacle, draw_box_money, draw_box_traffic, draw_nav_overlay,
     put_vi_text, vi_text_size,
-    # Tiện ích
-    build_preload_texts,
+    # §14 Tiện ích
+    build_preload_texts, normalize_money_label,
+    DistanceCalibrator,
 )
 
-# ── FaceRecognizer (tuỳ chọn) ─────────────────────────────────────────────────
+# ── FaceRecognizer (tùy chọn) ─────────────────────────────────────────────────
 try:
     from face_module import FaceRecognizer
     _FACE_MODULE_OK = True
 except ImportError:
     _FACE_MODULE_OK = False
+    print("[Face] ⚠  face_module.py không tìm thấy.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,6 +120,9 @@ class BlindAssistantGUI(ctk.CTk):
         self.geometry("1280x800")
         self.minsize(960, 620)
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        # Phím tắt toàn cục: W = đọc giờ
+        self.bind("<KeyPress-w>", lambda e: self._announce_time())
+        self.bind("<KeyPress-W>", lambda e: self._announce_time())
 
         # ── Biến trạng thái các công tắc ─────────────────────────────────────
         self.mode_money   = tk.BooleanVar(value=False)
@@ -119,9 +142,15 @@ class BlindAssistantGUI(ctk.CTk):
         self._fps_n      = 0
         self.fps_disp    = 0.0
 
-        # ── Cache nhận diện mặt: {(x//20, y//20): (name, expire_frame)} ──────
-        self.face_cache: dict[tuple, tuple[str, int]] = {}
+        # ── Cache nhận diện mặt ───────────────────────────────────────────────
+        # key   = (x1//50, y1//50)       — grid thô, ít nhạy với chuyển động nhỏ
+        # value = (name, expire_frame, vote_buf)
+        self.face_cache: dict[tuple, tuple] = {}
         self.ocr_scanning = False
+
+        # ── Lưu bbox gần nhất để calibrate khoảng cách [C] ──────────────────
+        # Per-class bbox cache cho calibration: {cls_name: {cls,x1,y1,x2,y2,dist_m}}
+        self._last_bbox_for_calib: dict[str, dict] = {}
 
         # ── AI modules (khởi tạo trong background thread) ─────────────────────
         self.speaker        = None
@@ -132,6 +161,8 @@ class BlindAssistantGUI(ctk.CTk):
         self.ocr            = None
         self.traffic_an     = None
         self.face_rec       = _DummyFaceRec()
+        self.logger         = None   # SessionLogger — khởi tạo trong _init_ai
+        self.time_reader    = None   # TimeReader — khởi tạo sau khi speaker sẵn sàng
         self._ai_ready      = False
 
         # ── Xây giao diện ────────────────────────────────────────────────────
@@ -209,6 +240,7 @@ class BlindAssistantGUI(ctk.CTk):
         self._sec_face()
         self._sec_camera()
         self._sec_test()
+        self._sec_time_history()   # ← Nút giờ + lịch sử
         self._sec_log()
 
     # ── Section: Công tắc chế độ ──────────────────────────────────────────────
@@ -315,7 +347,7 @@ class BlindAssistantGUI(ctk.CTk):
 
     # ── Section: Test ảnh ─────────────────────────────────────────────────────
     def _sec_test(self):
-        sec = _CardSection(self.ctrl, "🧪  KIỂM THỬ ẢNH")
+        sec = _CardSection(self.ctrl, "🧪  KIỂM THỬ & HIỆU CHỈNH")
 
         self.btn_test = ctk.CTkButton(
             sec, text="📂  Tải ảnh & Phân tích tổng hợp",
@@ -323,7 +355,144 @@ class BlindAssistantGUI(ctk.CTk):
             height=40, font=ctk.CTkFont(size=13, weight="bold"),
             command=self._upload_and_test
         )
-        self.btn_test.pack(padx=16, pady=(4, 12), fill="x")
+        self.btn_test.pack(padx=16, pady=(4, 4), fill="x")
+
+        # ── Calibration khoảng cách ──────────────────────────────────────────
+        self.btn_calib = ctk.CTkButton(
+            sec, text="📏  CALIBRATE KHOẢNG CÁCH  [C]",
+            fg_color="#1a5276", hover_color="#21618c",
+            height=40, font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._do_calibrate
+        )
+        self.btn_calib.pack(padx=16, pady=(0, 4), fill="x")
+
+        self.lbl_calib_info = ctk.CTkLabel(
+            sec, text="focal: đang load...",
+            font=ctk.CTkFont(size=11), text_color=C_GRAY
+        )
+        self.lbl_calib_info.pack(pady=(0, 10))
+
+    # ── Section: Giờ hiện tại + Xem lịch sử ─────────────────────────────────
+    def _sec_time_history(self):
+        sec = _CardSection(self.ctrl, "🕐  THỜI GIAN & LỊCH SỬ")
+
+        # Nhãn đồng hồ
+        self.lbl_clock = ctk.CTkLabel(
+            sec,
+            text=TimeReader.now_display(),
+            font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
+            text_color=C_YELLOW,
+        )
+        self.lbl_clock.pack(pady=(6, 4))
+
+        # Nút đọc giờ
+        ctk.CTkButton(
+            sec,
+            text="🕐  ĐỌC GIỜ HIỆN TẠI  [W]",
+            fg_color="#1a5276", hover_color="#21618c",
+            height=40, font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._announce_time,
+        ).pack(padx=16, pady=(2, 4), fill="x")
+
+        # ── Log level selector ──────────────────────────────────────────────
+        lv_frame = ctk.CTkFrame(sec, fg_color="transparent")
+        lv_frame.pack(fill="x", padx=16, pady=(0, 4))
+
+        ctk.CTkLabel(lv_frame, text="Cường độ ghi log:",
+                     font=ctk.CTkFont(size=11), text_color=C_GRAY).pack(side="left")
+
+        self._log_level_var = ctk.StringVar(value="normal")
+        for lv, lbl, color in [
+            ("summary", "Tóm tắt", "#636e72"),
+            ("normal",  "Bình thường", "#27ae60"),
+            ("detail",  "Chi tiết", "#e17055"),
+        ]:
+            ctk.CTkRadioButton(
+                lv_frame, text=lbl, value=lv,
+                variable=self._log_level_var,
+                font=ctk.CTkFont(size=11),
+                fg_color=color,
+                command=lambda lv=lv: self._set_log_level(lv),
+            ).pack(side="left", padx=6)
+
+        # Nhãn trạng thái logger
+        self.lbl_log_stat = ctk.CTkLabel(
+            sec,
+            text="🔴 Chờ khởi động...",
+            font=ctk.CTkFont(family="Consolas", size=10),
+            text_color=C_GRAY,
+        )
+        self.lbl_log_stat.pack(pady=(0, 4))
+
+        # Nút xem lịch sử
+        ctk.CTkButton(
+            sec,
+            text="📋  XEM LỊCH SỬ PHIÊN NÀY",
+            fg_color="#145a32", hover_color="#1e8449",
+            height=40, font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._show_history,
+        ).pack(padx=16, pady=(0, 4), fill="x")
+
+        # Nút mở thư mục logs
+        ctk.CTkButton(
+            sec,
+            text="📂  Mở thư mục logs/",
+            fg_color=C_CARD, hover_color="#333",
+            height=32, font=ctk.CTkFont(size=11),
+            command=self._open_log_folder,
+        ).pack(padx=16, pady=(0, 10), fill="x")
+
+        self._tick_clock()
+
+    def _set_log_level(self, level: str):
+        """Thay đổi mức độ ghi log ngay khi đang chạy."""
+        if self.logger:
+            self.logger.set_level(level)
+            self._update_log_stat()
+            labels = {"summary": "Tóm tắt (nhỏ nhất)",
+                      "normal": "Bình thường", "detail": "Chi tiết (debug)"}
+            self._log(f"[Logger] Level → {labels.get(level, level)}", C_YELLOW)
+
+    def _update_log_stat(self):
+        """Cập nhật nhãn trạng thái logger."""
+        if not hasattr(self, "lbl_log_stat") or not self.logger:
+            return
+        try:
+            sm   = self.logger.get_summary()
+            n    = sm.get("events_in_ram", 0)
+            tot  = sm.get("total_detected", 0)
+            lv   = sm.get("level", "?")
+            t    = int(sm.get("duration_s", 0))
+            lv_icon = {"summary": "📊", "normal": "📝", "detail": "🔍"}.get(lv, "?")
+            txt = (f"{lv_icon} {lv} | {t}s | "
+                   f"phát hiện={tot} | RAM={n}/{self.logger.MAX_EVENTS}")
+            color = C_GREEN if n < self.logger.MAX_EVENTS * 0.8 else C_ORANGE
+            self.lbl_log_stat.configure(text=txt, text_color=color)
+        except Exception:
+            pass
+
+    def _open_log_folder(self):
+        import subprocess, platform
+        log_dir = os.path.abspath(SessionLogger.LOG_DIR)
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            if platform.system() == "Windows":
+                os.startfile(log_dir)
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", log_dir])
+            else:
+                subprocess.Popen(["xdg-open", log_dir])
+        except Exception as e:
+            self._log(f"Không mở được folder: {e}", C_ORANGE)
+
+    def _tick_clock(self):
+        try:
+            if hasattr(self, "lbl_clock"):
+                self.lbl_clock.configure(text=TimeReader.now_display())
+            self._update_log_stat()   # Cập nhật trạng thái logger mỗi giây
+            self.after(1000, self._tick_clock)
+        except Exception:
+            pass
 
     # ── Section: Log ─────────────────────────────────────────────────────────
     def _sec_log(self):
@@ -349,7 +518,8 @@ class BlindAssistantGUI(ctk.CTk):
             self.speaker   = BackgroundSpeaker()
             self.announcer = AnnouncementManager(self.speaker)
             self.nav       = NavigationGuide(self.speaker)
-            self._log("✓ TTS sẵn sàng", C_GREEN)
+            self.time_reader = TimeReader(self.speaker)
+            self._log("✓ TTS + TimeReader sẵn sàng", C_GREEN)
         except Exception as e:
             self._log(f"✗ TTS lỗi: {e}", C_RED)
             return
@@ -379,6 +549,10 @@ class BlindAssistantGUI(ctk.CTk):
             self._log(f"⚠ OCR: {e}", C_ORANGE)
 
         self.traffic_an = TrafficLightAnalyzer()
+
+        # ── SessionLogger ─────────────────────────────────────────────────────
+        self.logger = SessionLogger(enabled=True, level="normal")
+        self._log("✓ SessionLogger khởi động — lưu log vào logs/", C_GREEN)
 
         self._log("Đang load FaceRecognizer...")
         if _FACE_MODULE_OK:
@@ -413,6 +587,14 @@ class BlindAssistantGUI(ctk.CTk):
             build_preload_texts(extra_names=self.face_rec.known_names))
 
         self._ai_ready = True
+        # Cập nhật thông tin calibration
+        calib = DistanceEstimator.get_calibration()
+        calib_txt = (f"focal={calib.focal:.0f}px"
+                     + (" (đã calibrate)" if calib.scales else " (mặc định)"))
+        calib_col = C_GREEN if calib.scales else C_ORANGE
+        self.after(0, lambda t=calib_txt, c=calib_col:
+                   self.lbl_calib_info.configure(text=t, text_color=c))
+
         self._log("✅  Hệ thống AI sẵn sàng!", C_GREEN)
         self._safe_speak("Hệ thống hỗ trợ người khiếm thị đã sẵn sàng")
         self.after(0, self._start_camera)
@@ -524,8 +706,11 @@ class BlindAssistantGUI(ctk.CTk):
                 draw_box_money(annotated, d["x1"], d["y1"],
                                d["x2"], d["y2"], d["label"], d["conf"])
                 self.announcer.process_money(d["label"])
-                vi = MONEY_VI.get(d["label"], d["label"])
+                norm = normalize_money_label(d["label"])
+                vi   = MONEY_VI.get(norm, d["label"])
                 self._spk_bar(f"💰 {vi}")
+                if self.logger:
+                    self.logger.log_money(d["label"], d["conf"])
             return annotated
 
         # ────────────────────────────────────────────────────────────────────
@@ -550,53 +735,123 @@ class BlindAssistantGUI(ctk.CTk):
                     if cls_name == "traffic light" and self.mode_traffic.get():
                         crop = frame[max(0,y1):min(frame_h,y2),
                                      max(0,x1):min(frame_w,x2)]
-                        color_name = self.traffic_an.analyze(crop)
+                        # track_key riêng mỗi đèn → temporal voting không bị lẫn
+                        tl_key     = f"tl_{x1//40}_{y1//40}"
+                        color_name = self.traffic_an.analyze(crop, tl_key)
                         draw_box_traffic(annotated, x1, y1, x2, y2,
                                          color_name, conf_sc)
                         self.announcer.process_traffic(color_name)
                         vi_msg = TRAFFIC_VI.get(color_name, "Đèn giao thông")
                         self._spk_bar(f"🚦 {vi_msg}")
+                        if color_name != "unknown" and self.logger:
+                            self.logger.log_traffic(color_name)
                         continue
 
                     if cls_name not in TARGET_CLASSES:
                         continue
 
-                    # ── Ước lượng khoảng cách ────────────────────────────────
-                    state, dist_m = DistanceEstimator.classify(cls_name, y1, y2)
+                    # ── Ước lượng khoảng cách thông minh (calibration-aware) ──
+                    dist_track_key = f"{cls_name}_{x1//30}_{y1//30}"
+                    state, dist_m  = DistanceEstimator.classify(
+                        cls_name, y1, y2,
+                        x1=x1, x2=x2,
+                        frame_w=frame_w, frame_h=frame_h,
+                        track_key=dist_track_key,
+                    )
+
+                    # Lưu bbox per-class để calibrate riêng từng loại vật
+                    if (cls_name not in self._last_bbox_for_calib or
+                            dist_m < self._last_bbox_for_calib[cls_name].get("dist_m", 99)):
+                        self._last_bbox_for_calib[cls_name] = {
+                            "cls": cls_name,
+                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "dist_m": dist_m,
+                        }
 
                     # ── Nhận diện khuôn mặt (chỉ với "person") ───────────────
                     final_label = cls_name
                     is_known    = False
 
                     if cls_name == "person" and self.face_rec.is_ready:
-                        tk_key = (x1 // 20, y1 // 20)
+                        # Grid thô 50px: di chuyển nhẹ vẫn dùng cache cũ
+                        tk_key = (x1 // 50, y1 // 50)
+
                         if tk_key in self.face_cache:
-                            cached_name, expire = self.face_cache[tk_key]
+                            cached_name, expire, _buf = self.face_cache[tk_key]
                             if fc < expire:
                                 final_label = cached_name
                                 is_known    = (cached_name != "Unknown")
                             else:
                                 del self.face_cache[tk_key]
-                        if tk_key not in self.face_cache and run_face:
-                            crop = frame[max(0,y1):min(frame_h,y2),
-                                         max(0,x1):min(frame_w,x2)]
-                            pname = self.face_rec.identify(crop)
-                            self.face_cache[tk_key] = (pname, fc + FACE_SKIP * 5)
-                            final_label = pname
-                            is_known    = (pname != "Unknown")
-                            if is_known and self.announcer._can_announce(
-                                    f"face_{pname}", FACE_ANNOUNCE_CD):
-                                self._safe_speak(f"Phát hiện {pname}")
-                                self._spk_bar(f"👤 {pname}")
-                                self._log(f"[Face] ★ {pname}", C_YELLOW)
 
-                    # Dùng cls_name gốc cho navigation
+                        if tk_key not in self.face_cache and run_face:
+                            crop     = frame[max(0,y1):min(frame_h,y2),
+                                             max(0,x1):min(frame_w,x2)]
+                            new_name = self.face_rec.identify(crop)
+
+                            # Kế thừa vote_buf từ vị trí lân cận (±1 grid)
+                            old_buf: list[str] = []
+                            for otk, (on, oexp, ovb) in list(self.face_cache.items()):
+                                if (abs(otk[0]-tk_key[0]) <= 1 and
+                                        abs(otk[1]-tk_key[1]) <= 1 and
+                                        fc < oexp):
+                                    old_buf = ovb
+                                    break
+
+                            vote_buf = (old_buf + [new_name])[-8:]
+
+                            # Majority vote: ưu tiên tên người quen
+                            known_hits = [n for n in vote_buf if n != "Unknown"]
+                            if known_hits:
+                                from collections import Counter
+                                winner = Counter(known_hits).most_common(1)[0][0]
+                                # Sticky-known: chỉ revert khi 6 lần cuối đều Unknown
+                                unknown_streak = sum(
+                                    1 for n in reversed(vote_buf) if n == "Unknown"
+                                )
+                                final_name = "Unknown" if unknown_streak >= 6 else winner
+                            else:
+                                final_name = "Unknown"
+
+                            # TTL dài: FACE_SKIP × 20 ≈ 2 giây
+                            self.face_cache[tk_key] = (
+                                final_name, fc + FACE_SKIP * 20, vote_buf
+                            )
+                            final_label = final_name
+                            is_known    = (final_name != "Unknown")
+
+                            if is_known and new_name != "Unknown":
+                                self._log(
+                                    f"[Face] ★ {final_name}  "
+                                    f"(vote: {vote_buf[-4:]})", C_YELLOW)
+                                if self.logger:
+                                    self.logger.log_face(final_name, dist_m)
+                                if self.announcer._can_announce(
+                                        f"face_{final_name}", FACE_ANNOUNCE_CD):
+                                    self._safe_speak(f"Phát hiện {final_name}")
+                                    self._spk_bar(f"👤 {final_name}")
+
+                        elif tk_key in self.face_cache:
+                            cached_name, _, _buf = self.face_cache[tk_key]
+                            final_label = cached_name
+                            is_known    = (cached_name != "Unknown")
+
+                    # Ghi log vật cản (chỉ near/critical)
+                    if self.logger:
+                        self.logger.log_obstacle(cls_name, state, dist_m, conf_sc)
+
                     obstacle_det.append({
-                        "label":  final_label if not is_known else cls_name,
-                        "state":  state,
-                        "dist_m": dist_m,
+                        # BUG FIX: luôn dùng final_label (không ép về cls_name khi is_known)
+                        "label":    final_label,
+                        "is_known": is_known,
+                        "state":    state,
+                        "dist_m":   dist_m,
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     })
+
+                    # Người quen ở gần → thông báo riêng, cooldown 15s
+                    if is_known:
+                        self.announcer.process_face_nearby(final_label, state, dist_m)
 
                     draw_box_obstacle(annotated, x1, y1, x2, y2,
                                       final_label, conf_sc, state, dist_m,
@@ -604,8 +859,12 @@ class BlindAssistantGUI(ctk.CTk):
 
             # ── Thông báo vật cản + cập nhật status bar ──────────────────────
             if obstacle_det:
+                # process_obstacles tự bỏ qua is_known=True → không báo "người lạ"
                 self.announcer.process_obstacles(obstacle_det)
-                nearest = min(obstacle_det, key=lambda d: d["dist_m"])
+                # Status bar: ưu tiên vật LẠ gần nhất (không hiện người quen là vật cản)
+                stranger_dets = [d for d in obstacle_det if not d.get("is_known")]
+                show_dets     = stranger_dets if stranger_dets else obstacle_det
+                nearest = min(show_dets, key=lambda d: d["dist_m"])
                 vi  = CLASS_VI.get(nearest["label"], nearest["label"])
                 dvi = DistanceEstimator.dist_text_vi(nearest["dist_m"])
                 st  = nearest["state"]
@@ -638,6 +897,8 @@ class BlindAssistantGUI(ctk.CTk):
                     short = text[:OCR_MAX_CHARS]
                     self._log(f"[OCR] {short}", C_YELLOW)
                     self._spk_bar(f"📖 {short[:40]}")
+                    if self.logger:
+                        self.logger.log_ocr(text)
                 else:
                     self._safe_speak("Không tìm thấy văn bản")
                     self._log("[OCR] Không tìm thấy văn bản", C_GRAY)
@@ -767,6 +1028,403 @@ class BlindAssistantGUI(ctk.CTk):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _do_calibrate(self):
+        """
+        Hộp thoại Calibrate Khoảng Cách per-class.
+
+        - Hiển thị tất cả class đang detect trên màn hình.
+        - Người dùng nhập khoảng cách thực (cm) cho từng class muốn hiệu chỉnh.
+        - Multi-point averaging: mỗi lần nhập = thêm 1 điểm vào lịch sử.
+          Hệ thống tính scale trung bình → càng nhiều điểm đo càng chính xác.
+        - Lưu vào calib.json → tự load lần sau.
+        """
+        if not self._ai_ready:
+            self._log("⚠ Hệ thống chưa sẵn sàng", C_ORANGE)
+            return
+
+        calib   = DistanceEstimator.get_calibration()
+        bbox_map = self._last_bbox_for_calib
+
+        if not bbox_map:
+            self._log("⚠ Chưa detect vật thể nào. Đặt người/vật trước camera.", C_ORANGE)
+            self._safe_speak("Chưa phát hiện vật thể. Hãy đặt vật trước camera.")
+            return
+
+        # ── Cửa sổ calibration ──────────────────────────────────────────────
+        win = ctk.CTkToplevel(self)
+        win.title("📏 Calibrate Khoảng Cách — Học từng loại vật")
+        win.geometry("640x680")
+        win.grab_set()
+        win.resizable(False, False)
+
+        ctk.CTkLabel(
+            win,
+            text="📏  Hiệu chỉnh khoảng cách theo từng loại vật thể",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(pady=(16, 2))
+
+        ctk.CTkLabel(
+            win,
+            text=(f"focal={calib.focal:.0f}px  |  "
+                  f"Đang detect: {', '.join(bbox_map.keys())}  |  "
+                  f"Đã học: {len(calib.scales)} class"),
+            font=ctk.CTkFont(size=11),
+            text_color=C_GRAY,
+        ).pack(pady=(0, 8))
+
+        # ── Input per-class ──────────────────────────────────────────────────
+        frame_in = ctk.CTkScrollableFrame(
+            win, height=240,
+            label_text="① Nhập khoảng cách THỰC TẾ (cm) — bỏ trống để bỏ qua"
+        )
+        frame_in.pack(fill="x", padx=16, pady=(0, 8))
+
+        entries: dict[str, ctk.CTkEntry] = {}
+
+        for cls_name, bbox in sorted(bbox_map.items()):
+            vi       = CLASS_VI.get(cls_name, cls_name)
+            est_cm   = int(round(bbox["dist_m"] * 100))
+            cur_scale = calib.get_scale(cls_name)
+            n_pts    = calib.get_measurement_count(cls_name)
+            scale_str = (f"scale={cur_scale:.3f}  ({n_pts} điểm đo)"
+                         if cur_scale != 1.0 else "chưa học")
+
+            row = ctk.CTkFrame(frame_in, fg_color="transparent")
+            row.pack(fill="x", pady=5)
+
+            # Tên class
+            ctk.CTkLabel(
+                row,
+                text=f"{vi}\n({cls_name})",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                width=130, anchor="w",
+            ).pack(side="left", padx=(0, 6))
+
+            # Ước lượng + trạng thái học
+            ctk.CTkLabel(
+                row,
+                text=f"Hiện ước: {est_cm} cm\n{scale_str}",
+                font=ctk.CTkFont(family="Consolas", size=10),
+                text_color=C_GREEN if cur_scale != 1.0 else C_GRAY,
+                width=180,
+            ).pack(side="left", padx=4)
+
+            # Entry nhập khoảng cách thực
+            ent = ctk.CTkEntry(
+                row, width=88,
+                placeholder_text="cm thực",
+                font=ctk.CTkFont(family="Consolas", size=13),
+            )
+            # Pre-fill ước lượng hiện tại
+            ent.insert(0, str(est_cm))
+            ent.select_range(0, "end")
+            ent.pack(side="left", padx=4)
+
+            ctk.CTkLabel(row, text="cm", font=ctk.CTkFont(size=11),
+                         text_color=C_GRAY).pack(side="left")
+            entries[cls_name] = ent
+
+        # ── Bảng lịch sử học ────────────────────────────────────────────────
+        frame_hist = ctk.CTkFrame(win, fg_color="#111827", corner_radius=8)
+        frame_hist.pack(fill="x", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(
+            frame_hist,
+            text="② Lịch sử học (calib.json):",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=C_YELLOW,
+        ).pack(anchor="w", padx=12, pady=(8, 0))
+
+        def _make_hist_text():
+            lines = []
+            all_hist = calib.get_all_history()
+            if not calib.scales and not all_hist:
+                return "  (Chưa có dữ liệu — nhập khoảng cách thực để bắt đầu học)"
+            header = f"  {'Vật thể':<16} {'Scale':>7}  {'Điểm đo':>7}  Lịch sử (4 gần nhất)"
+            lines.append(header)
+            lines.append("  " + "─" * 60)
+            for cls in sorted(set(list(calib.scales.keys()) + list(all_hist.keys()))):
+                vi      = CLASS_VI.get(cls, cls)
+                scale   = calib.scales.get(cls, 1.0)
+                hist    = all_hist.get(cls, [])
+                n       = len(hist)
+                recent  = "  ".join(f"{s:.3f}" for s in hist[-4:])
+                effect  = f"{'+' if scale >= 1 else ''}{(scale-1)*100:.0f}%"
+                lines.append(f"  {vi:<16} {scale:>7.4f}  {n:>7}  [{recent}]  {effect}")
+            lines.append(f"\n  focal={calib.focal:.1f}px  |  file: {calib._file}")
+            return "\n".join(lines)
+
+        hist_lbl = ctk.CTkLabel(
+            frame_hist,
+            text=_make_hist_text(),
+            font=ctk.CTkFont(family="Consolas", size=10),
+            text_color="#9ca3af",
+            justify="left",
+        )
+        hist_lbl.pack(anchor="w", padx=12, pady=(2, 8))
+
+        result_lbl = ctk.CTkLabel(win, text="", font=ctk.CTkFont(size=11),
+                                  text_color=C_GREEN, wraplength=580)
+        result_lbl.pack(pady=4)
+
+        # ── Nút bấm ─────────────────────────────────────────────────────────
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(4, 16))
+
+        def _apply():
+            applied, errors = [], []
+            for cls_name, ent in entries.items():
+                raw = ent.get().strip().replace(",", ".")
+                if not raw:
+                    continue
+                try:
+                    dist_cm = float(raw)
+                    if dist_cm <= 0 or dist_cm > 3000:
+                        raise ValueError("Ngoài phạm vi hợp lệ (0–3000 cm)")
+                    bbox = bbox_map[cls_name]
+                    new_scale = calib.add_class_measurement(
+                        cls_name,
+                        bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"],
+                        dist_cm / 100.0,
+                        frame_w=640, frame_h=480,   # kích thước webcam chuẩn
+                    )
+                    n = calib.get_measurement_count(cls_name)
+                    vi = CLASS_VI.get(cls_name, cls_name)
+                    applied.append(
+                        f"✓ {vi}: {int(round(bbox['dist_m']*100))}cm→{int(dist_cm)}cm  "
+                        f"scale={new_scale:.4f}  ({n} điểm đo)"
+                    )
+                    self._log(
+                        f"[Calib] {vi}: ước={int(round(bbox['dist_m']*100))}cm "
+                        f"thực={int(dist_cm)}cm → scale={new_scale:.4f} ({n} điểm)",
+                        C_GREEN
+                    )
+                except ValueError as e:
+                    errors.append(f"✗ {cls_name}: {e}")
+
+            if applied:
+                result_lbl.configure(
+                    text="\n".join(applied + (["Lỗi: " + e for e in errors] if errors else [])),
+                    text_color=C_GREEN,
+                )
+                # Cập nhật bảng lịch sử
+                hist_lbl.configure(text=_make_hist_text())
+                # Cập nhật nhãn bên ngoài
+                n_learned = len(calib.scales)
+                self.lbl_calib_info.configure(
+                    text=f"focal={calib.focal:.0f}px | {n_learned} class đã học",
+                    text_color=C_GREEN,
+                )
+                self._safe_speak("Đã cập nhật khoảng cách, hệ thống học xong")
+                if self.logger:
+                    self.logger.log_system(
+                        "Calibrate: " + " | ".join(applied)
+                    )
+            else:
+                result_lbl.configure(
+                    text="Không có thay đổi (bỏ trống hoặc lỗi).",
+                    text_color=C_ORANGE,
+                )
+
+        def _reset_class():
+            """Xóa scale của class được chọn đầu tiên."""
+            if not bbox_map:
+                return
+            cls_to_reset = next(iter(bbox_map))
+            if cls_to_reset in calib.scales:
+                del calib.scales[cls_to_reset]
+                calib.save()
+                hist_lbl.configure(text=_make_hist_text())
+                result_lbl.configure(
+                    text=f"✓ Đã xóa scale của '{cls_to_reset}'",
+                    text_color=C_ORANGE,
+                )
+
+        def _reset_all():
+            calib.scales.clear()
+            calib.save()
+            hist_lbl.configure(text=_make_hist_text())
+            result_lbl.configure(text="✓ Đã xóa toàn bộ scale correction.",
+                                 text_color=C_ORANGE)
+            self.lbl_calib_info.configure(
+                text=f"focal={calib.focal:.0f}px | Đã reset",
+                text_color=C_ORANGE,
+            )
+            self._log("[Calib] Reset toàn bộ per-class scales", C_ORANGE)
+
+        ctk.CTkButton(
+            btn_row, text="✓  Áp dụng & Lưu",
+            fg_color="#1e8449", hover_color="#27ae60",
+            height=44, font=ctk.CTkFont(size=13, weight="bold"),
+            command=_apply,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        ctk.CTkButton(
+            btn_row, text="↺  Reset tất cả",
+            fg_color=C_CARD, hover_color="#555",
+            height=44, font=ctk.CTkFont(size=11),
+            command=_reset_all,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            btn_row, text="✖  Đóng",
+            fg_color=C_CARD, hover_color="#555",
+            height=44,
+            command=win.destroy,
+        ).pack(side="left")
+
+    def _announce_time(self):
+        """Đọc giờ hiện tại qua TTS và hiển thị lên log."""
+        if not self._ai_ready or self.time_reader is None:
+            self._log("⚠ Hệ thống chưa sẵn sàng", C_ORANGE)
+            return
+        text = self.time_reader.announce()
+        self._log(f"[Giờ] {text}", C_YELLOW)
+        self._spk_bar(f"🕐 {text}")
+        if self.logger:
+            self.logger.log_system(f"Đọc giờ: {text}")
+
+    def _show_history(self):
+        """Cửa sổ xem lịch sử phiên — hiển thị tóm tắt trước, chi tiết sau."""
+        import tkinter as tk
+
+        if not self.logger or not self.logger.enabled:
+            self._log("⚠ Logger chưa khởi tạo", C_ORANGE)
+            return
+
+        sm = self.logger.get_summary()
+
+        win = ctk.CTkToplevel(self)
+        win.title("📋 Lịch sử phiên hoạt động")
+        win.geometry("700x580")
+        win.grab_set()
+
+        # ── PHẦN 1: SUMMARY CARD ─────────────────────────────────────────────
+        top = ctk.CTkFrame(win, fg_color="#111827", corner_radius=10)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+
+        dur  = int(sm.get("duration_s", 0))
+        tot  = sm.get("total_detected", 0)
+        lv   = sm.get("level", "normal")
+        n_ev = sm.get("events_in_ram", 0)
+        lv_icon = {"summary": "📊", "normal": "📝", "detail": "🔍"}.get(lv, "?")
+
+        ctk.CTkLabel(
+            top,
+            text=f"Thời gian chạy: {dur//60}m {dur%60}s  |  "
+                 f"Tổng phát hiện: {tot} lần  |  "
+                 f"{lv_icon} Level: {lv}  |  RAM: {n_ev}/{self.logger.MAX_EVENTS}",
+            font=ctk.CTkFont(family="Consolas", size=11),
+            text_color=C_YELLOW,
+        ).pack(pady=8, padx=12)
+
+        # Thanh tiến trình bộ nhớ RAM
+        pct = n_ev / max(self.logger.MAX_EVENTS, 1)
+        bar_w = int(600 * pct)
+        bar_color = C_GREEN if pct < 0.7 else C_ORANGE if pct < 0.9 else C_RED
+        bar_frame = ctk.CTkFrame(top, fg_color="#1a1a2e", height=8, corner_radius=4)
+        bar_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ctk.CTkFrame(bar_frame, fg_color=bar_color, height=8,
+                     width=bar_w, corner_radius=4).place(x=0, y=0)
+
+        # ── PHẦN 2: TÓM TẮT PHÁT HIỆN ───────────────────────────────────────
+        mid = ctk.CTkFrame(win, fg_color="transparent")
+        mid.pack(fill="x", padx=16, pady=(0, 6))
+        mid.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        def _stat_card(parent, col, title, data: dict, color: str):
+            f = ctk.CTkFrame(parent, fg_color="#1a1a2e", corner_radius=8)
+            f.grid(row=0, column=col, padx=4, sticky="nsew")
+            ctk.CTkLabel(f, text=title,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=color).pack(pady=(6, 2))
+            if data:
+                for k, v in list(data.items())[:5]:
+                    ctk.CTkLabel(f,
+                                 text=f"{k[:12]}: {v}x",
+                                 font=ctk.CTkFont(family="Consolas", size=10),
+                                 text_color="#9ca3af").pack()
+            else:
+                ctk.CTkLabel(f, text="(trống)",
+                             font=ctk.CTkFont(size=10),
+                             text_color="#4b5563").pack()
+            ctk.CTkLabel(f, text="").pack(pady=2)
+
+        _stat_card(mid, 0, "🚧 Vật cản",  sm.get("obstacles", {}), C_RED)
+        _stat_card(mid, 1, "👤 Khuôn mặt", sm.get("faces", {}),     C_YELLOW)
+        _stat_card(mid, 2, "💰 Tiền",      sm.get("money", {}),      C_GREEN)
+        _stat_card(mid, 3, "🚦 Đèn GT",    sm.get("traffic", {}),    C_ORANGE)
+
+        # ── PHẦN 3: DANH SÁCH SỰ KIỆN (có bộ lọc) ───────────────────────────
+        events = self.logger._events
+        filter_var = ctk.StringVar(value="all")
+
+        tab_frame = ctk.CTkFrame(win, fg_color="transparent")
+        tab_frame.pack(fill="x", padx=16, pady=(2, 0))
+
+        ctk.CTkLabel(tab_frame, text="Lọc:",
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 4))
+        for val, lbl in [("all", "Tất cả"), ("obstacle", "Vật cản"),
+                          ("face", "Mặt"), ("money", "Tiền"),
+                          ("traffic", "Đèn"), ("ocr", "OCR"), ("system", "Hệ thống")]:
+            ctk.CTkRadioButton(
+                tab_frame, text=lbl, value=val,
+                variable=filter_var, font=ctk.CTkFont(size=10),
+                command=lambda: _refresh(),
+            ).pack(side="left", padx=4)
+
+        txt = ctk.CTkTextbox(
+            win, font=ctk.CTkFont(family="Consolas", size=10),
+            fg_color="#0d1117", text_color="#c9d1d9",
+        )
+        txt.pack(padx=16, pady=(4, 4), fill="both", expand=True)
+
+        COLORS = {"obstacle": "#ef4444", "face": "#f1c40f", "traffic": "#e67e22",
+                  "money": "#2ecc71", "ocr": "#3498db", "nav": "#9b59b6",
+                  "system": "#6b7280"}
+
+        def _refresh():
+            fv = filter_var.get()
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            shown = [e for e in events if fv == "all" or e["event_type"] == fv]
+            if not shown:
+                txt.insert("end", "  (Không có sự kiện nào)\n", "gray")
+                txt.tag_config("gray", foreground="#4b5563")
+            for ev in shown:
+                et = ev["event_type"]
+                c  = COLORS.get(et, "#888")
+                ts = ev.get("timestamp", "")
+                vi = ev.get("label_vi", "") or ev.get("note", "")[:50]
+                st = ev.get("state", "")
+                dd = ev.get("dist_display", "")
+                cf = ev.get("conf", "")
+                nt = ev.get("note", "")[:60]
+                parts = [f"[{ts}]", f"[{et:8s}]", vi]
+                if st:  parts.append(st)
+                if dd:  parts.append(dd)
+                if cf:  parts.append(cf)
+                if nt and et in ("ocr", "system"): parts.append(f"→ {nt}")
+                line = "  ".join(p for p in parts if p.strip()) + "\n"
+                txt.insert("end", line, et)
+                txt.tag_config(et, foreground=c)
+            txt.configure(state="disabled")
+        _refresh()
+
+        # Nút dưới
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=(2, 12), padx=16, fill="x")
+        ctk.CTkButton(btn_row, text="📂  Mở logs/", fg_color=C_BLUE, width=140,
+                      command=self._open_log_folder).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="🗑  Xóa RAM", fg_color=C_CARD, width=120,
+                      command=lambda: (
+                          self.logger._events.clear(),
+                          _refresh(),
+                          self._log("[Logger] Đã xóa log khỏi RAM", C_ORANGE),
+                      )).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="✖  Đóng", fg_color=C_CARD,
+                      command=win.destroy).pack(side="right")
+
     # ══════════════════════════════════════════════════════════════════════════
     #  HÀM TIỆN ÍCH NỘI BỘ
     # ══════════════════════════════════════════════════════════════════════════
@@ -800,6 +1458,10 @@ class BlindAssistantGUI(ctk.CTk):
         time.sleep(0.1)
         if self.cap:
             self.cap.release()
+        if self.logger:
+            summary = self.logger.close()
+            if summary:
+                print(f"[Logger] Log đã lưu: {summary.get('csv_path','')}")
         if self.speaker:
             self.speaker.stop()
         self.destroy()

@@ -15,6 +15,7 @@ from core_engine import (
     BackgroundSpeaker, AnnouncementManager,
     DistanceEstimator, NavigationGuide,
     MoneyDetector, OCRReader, TrafficLightAnalyzer,
+    SessionLogger, TimeReader,
     draw_box_obstacle, draw_box_money, draw_box_traffic, draw_nav_overlay,
     put_vi_text, vi_text_size,
     build_preload_texts,
@@ -100,6 +101,10 @@ def main():
     ocr              = OCRReader()
     traffic_analyzer = TrafficLightAnalyzer()
 
+    # ── SessionLogger: ghi lịch sử nhận diện ra logs/ ────────────────────────
+    logger      = SessionLogger(enabled=True)
+    time_reader = TimeReader(speaker)
+
     speaker.say("Hệ thống hỗ trợ người khiếm thị đã sẵn sàng")
 
     # ── Thread nhận input terminal (phím N) ───────────────────────────────────
@@ -133,8 +138,16 @@ def main():
     ocr_scanning   = False
     frame_count    = 0
     last_annotated = None
-    face_cache: dict[tuple, tuple[str, int]] = {}  # {(x//20,y//20): (name, expire)}
+    # Cache nhận diện mặt:
+    # key   = (x1//50, y1//50)       — grid thô, ít nhạy với chuyển động nhỏ
+    # value = (name, expire_frame, vote_buf)
+    #   name:         tên đã vote hoặc "Unknown"
+    #   expire_frame: frame hết hạn  (FACE_SKIP × 20 ≈ 2 giây)
+    #   vote_buf:     list 8 kết quả gần nhất để majority vote
+    face_cache: dict[tuple, tuple] = {}
     fps_t0, fps_n, fps_disp = time.perf_counter(), 0, 0.0
+    # Per-class bbox cache cho calibration: {cls_name: {x1,y1,x2,y2,dist_m}}
+    _bbox_calib: dict[str, dict] = {}
 
     # ══════════════════════════════════════════════════════════════════════════
     #  VÒNG LẶP CAMERA CHÍNH
@@ -195,47 +208,98 @@ def main():
                     if cls_name == "traffic light" and mode_traffic:
                         crop = frame[max(0,y1):min(frame_h,y2),
                                      max(0,x1):min(frame_w,x2)]
-                        color_name = traffic_analyzer.analyze(crop)
+                        tl_key     = f"tl_{x1//40}_{y1//40}"
+                        color_name = traffic_analyzer.analyze(crop, tl_key)
                         draw_box_traffic(annotated, x1, y1, x2, y2,
                                          color_name, conf_sc)
                         announcer.process_traffic(color_name)
+                        if color_name != "unknown":
+                            logger.log_traffic(color_name)
                         continue
 
                     if cls_name not in TARGET_CLASSES:
                         continue
 
-                    # ── Ước lượng khoảng cách ────────────────────────────────
-                    state, dist_m = DistanceEstimator.classify(cls_name, y1, y2)
+                    # ── Ước lượng khoảng cách (full bbox + track_key có prefix class) ──
+                    dist_track = f"{cls_name}_{x1//30}_{y1//30}"
+                    state, dist_m = DistanceEstimator.classify(
+                        cls_name, y1, y2,
+                        x1=x1, x2=x2,
+                        frame_w=frame_w, frame_h=frame_h,
+                        track_key=dist_track,
+                    )
+
+                    # Lưu bbox per-class cho calibration (phím C)
+                    if (cls_name not in _bbox_calib or
+                            dist_m < _bbox_calib[cls_name].get("dist_m", 99)):
+                        _bbox_calib[cls_name] = {
+                            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                            "dist_m": dist_m,
+                        }
 
                     # ── Nhận diện khuôn mặt (chỉ với "person") ───────────────
                     final_label = cls_name
                     is_known    = False
 
                     if cls_name == "person" and face_rec.is_ready:
-                        track_key = (x1 // 20, y1 // 20)
+                        track_key = (x1 // 50, y1 // 50)
+
                         if track_key in face_cache:
-                            cached_name, expire = face_cache[track_key]
+                            cached_name, expire, _buf = face_cache[track_key]
                             if frame_count < expire:
                                 final_label = cached_name
                                 is_known    = (cached_name != "Unknown")
                             else:
                                 del face_cache[track_key]
+
                         if track_key not in face_cache and run_face:
-                            crop = frame[max(0,y1):min(frame_h,y2),
-                                         max(0,x1):min(frame_w,x2)]
-                            person_name = face_rec.identify(crop)
+                            crop     = frame[max(0,y1):min(frame_h,y2),
+                                             max(0,x1):min(frame_w,x2)]
+                            new_name = face_rec.identify(crop)
+
+                            old_buf: list[str] = []
+                            for tk, (cn, exp, vb) in list(face_cache.items()):
+                                if (abs(tk[0]-track_key[0]) <= 1 and
+                                        abs(tk[1]-track_key[1]) <= 1 and
+                                        frame_count < exp):
+                                    old_buf = vb
+                                    break
+
+                            vote_buf = (old_buf + [new_name])[-8:]
+                            known_hits = [n for n in vote_buf if n != "Unknown"]
+                            if known_hits:
+                                from collections import Counter
+                                winner = Counter(known_hits).most_common(1)[0][0]
+                                unknown_streak = sum(
+                                    1 for n in reversed(vote_buf) if n == "Unknown"
+                                )
+                                final_name = "Unknown" if unknown_streak >= 6 else winner
+                            else:
+                                final_name = "Unknown"
+
                             face_cache[track_key] = (
-                                person_name, frame_count + FACE_SKIP * 5)
-                            final_label = person_name
-                            is_known    = (person_name != "Unknown")
-                            if is_known:
-                                print(f"[FaceRec] ★ Phát hiện: {person_name}")
+                                final_name, frame_count + FACE_SKIP * 20, vote_buf
+                            )
+                            final_label = final_name
+                            is_known    = (final_name != "Unknown")
+
+                            if is_known and new_name != "Unknown":
+                                print(f"[FaceRec] ★ {final_name}  "
+                                      f"(vote: {vote_buf[-4:]})")
+                                logger.log_face(final_name, dist_m)
                                 if announcer._can_announce(
-                                        f"face_{person_name}", FACE_ANNOUNCE_CD):
-                                    speaker.say(f"Phát hiện {person_name}",
+                                        f"face_{final_name}", FACE_ANNOUNCE_CD):
+                                    speaker.say(f"Phát hiện {final_name}",
                                                 priority=False)
 
-                    # Dùng cls_name gốc cho navigation (không phải tên người)
+                        elif track_key in face_cache:
+                            cached_name, _, _buf = face_cache[track_key]
+                            final_label = cached_name
+                            is_known    = (cached_name != "Unknown")
+
+                    # Ghi log vật cản (chỉ near/critical)
+                    logger.log_obstacle(cls_name, state, dist_m, conf_sc)
+
                     obstacle_det.append({
                         "label":  final_label if not is_known else cls_name,
                         "state":  state,
@@ -260,6 +324,7 @@ def main():
                 draw_box_money(annotated, det["x1"], det["y1"],
                                det["x2"], det["y2"], det["label"], det["conf"])
                 announcer.process_money(det["label"])
+                logger.log_money(det["label"], det["conf"])
 
         # ────────────────────────────────────────────────────────────────────
         #  OCR — lấy kết quả từ background thread
@@ -271,6 +336,7 @@ def main():
                 ocr_scanning = False
                 if text.strip():
                     announcer.process_ocr(text, ocr_reader=ocr)
+                    logger.log_ocr(text)
                     print(f"[OCR] Kết quả: {text[:100]}")
                 else:
                     speaker.say("Không tìm thấy văn bản")
@@ -331,17 +397,20 @@ def main():
 
         if key == ord("q"):
             print("\n[INFO] Người dùng yêu cầu thoát.")
+            logger.log_system("Người dùng nhấn Q thoát")
             break
 
         elif key == ord("m"):
             mode_money = not mode_money
             speaker.say(f"Chế độ nhận diện tiền đã {'bật' if mode_money else 'tắt'}")
+            logger.log_system(f"Chế độ tiền: {'BẬT' if mode_money else 'TẮT'}")
             print(f"[Mode] Tiền: {'BẬT' if mode_money else 'TẮT'}")
 
         elif key == ord("t"):
             mode_traffic = not mode_traffic
             if mode_traffic:
                 speaker.say("Chế độ đèn giao thông đã bật")
+            logger.log_system(f"Chế độ đèn GT: {'BẬT' if mode_traffic else 'TẮT'}")
             print(f"[Mode] Đèn GT: {'BẬT' if mode_traffic else 'TẮT'}")
 
         elif key == ord("o"):
@@ -369,14 +438,74 @@ def main():
             face_cache.clear()
             if face_rec.is_ready:
                 speaker.say("Đã cập nhật danh sách khuôn mặt")
+                logger.log_system(f"Reload face: {face_rec.stats()}")
                 print(face_rec.stats())
             else:
                 speaker.say("Nhận diện khuôn mặt chưa sẵn sàng")
+
+        elif key == ord("w"):
+            # Phím W: đọc giờ hiện tại
+            text = time_reader.announce()
+            logger.log_system(f"Đọc giờ: {text}")
+
+        elif key == ord("c"):
+            # Phím C: hiệu chỉnh khoảng cách per-class (multi-point averaging)
+            calib = DistanceEstimator.get_calibration()
+            if not _bbox_calib:
+                print("[Calib] Chưa detect vật thể. Đặt vật trước camera.")
+            else:
+                print(f"\n[Calib] ─── Calibrate per-class ───────────────────────")
+                print(f"[Calib] focal={calib.focal:.1f}px | "
+                      f"Đang detect: {list(_bbox_calib.keys())}")
+                print("[Calib] Để trống hoặc nhập 0 → bỏ qua class đó.\n")
+                applied = []
+                for cls_name, bbox in sorted(_bbox_calib.items()):
+                    vi     = CLASS_VI.get(cls_name, cls_name)
+                    est_cm = int(round(bbox["dist_m"] * 100))
+                    n_pts  = calib.get_measurement_count(cls_name)
+                    cur_sc = calib.get_scale(cls_name)
+                    print(f"  {vi} ({cls_name}): ước={est_cm}cm | "
+                          f"scale={cur_sc:.4f} | {n_pts} điểm đã học")
+                    try:
+                        raw = input("    Khoảng cách thực (cm) [Enter=bỏ qua]: ").strip()
+                        if not raw:
+                            continue
+                        dist_cm = float(raw.replace(",", "."))
+                        if dist_cm <= 0:
+                            continue
+                        new_scale = calib.add_class_measurement(
+                            cls_name,
+                            bbox["x1"], bbox["y1"], bbox["x2"], bbox["y2"],
+                            dist_cm / 100.0,
+                            frame_w=frame_w, frame_h=frame_h,
+                        )
+                        n_new = calib.get_measurement_count(cls_name)
+                        msg = (f"{vi}: {est_cm}cm→{int(dist_cm)}cm  "
+                               f"scale={new_scale:.4f} ({n_new} điểm học)")
+                        applied.append(msg)
+                        print(f"    ✓ {msg}")
+                    except (ValueError, EOFError):
+                        print(f"    Bỏ qua {cls_name}.")
+                if applied:
+                    speaker.say("Đã cập nhật khoảng cách")
+                    logger.log_system("Calibrate: " + " | ".join(applied))
+
+        elif key == ord("r"):
+            # Phím R: reset toàn bộ per-class scales
+            calib = DistanceEstimator.get_calibration()
+            calib.scales.clear()
+            calib.save()
+            speaker.say("Đã đặt lại hiệu chỉnh khoảng cách")
+            logger.log_system("Reset calibration scales")
+            print("[Calib] Đã reset toàn bộ per-class scales.")
 
     # ── Dọn dẹp ──────────────────────────────────────────────────────────────
     stop_event.set()
     cap.release()
     cv2.destroyAllWindows()
+    summary = logger.close()   # Ghi file log và in tóm tắt
+    if summary:
+        print(f"[INFO] Log đã lưu tại: {summary['csv_path']}")
     speaker.stop()
     print("[INFO] Thoát hệ thống. Tạm biệt!")
 
